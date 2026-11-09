@@ -2,10 +2,16 @@
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+import asyncio
 import base64
+import ipaddress
 import json
 import mimetypes
+from pathlib import Path
 import re
+import socket
+import time
+import uuid
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
@@ -19,8 +25,11 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict
 
 from ..core.auth import AuthManager, verify_api_key_flexible
+from ..core.account_tiers import get_paygate_tier_label, normalize_user_paygate_tier
+from ..core.config import config
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
 from ..core.models import (
@@ -28,11 +37,26 @@ from ..core.models import (
     ChatMessage,
     GeminiContent,
     GeminiGenerateContentRequest,
+    Task,
 )
 from ..services.generation_handler import MODEL_CONFIG, GenerationHandler
 from ..services.browser_captcha_extension import ExtensionCaptchaService
 
 router = APIRouter()
+_background_video_tasks: Dict[str, asyncio.Task] = {}
+_video_task_store: Dict[str, Task] = {}
+_ALLOWED_CACHE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".avif",
+    ".mp4",
+    ".webm",
+    ".mov",
+}
 
 MARKDOWN_IMAGE_RE = re.compile(r"!\[.*?\]\((.*?)\)")
 HTML_VIDEO_RE = re.compile(r"<video[^>]+src=['\"](.*?)['\"]", re.IGNORECASE)
@@ -183,21 +207,91 @@ def _guess_mime_type(uri: str, fallback: str) -> str:
     return guessed or fallback
 
 
+def _is_safe_remote_media_url(url: str) -> bool:
+    """Block SSRF against loopback, private, link-local, and metadata IPs."""
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+
+    cache_base = (config.cache_base_url or "").strip().rstrip("/")
+    if cache_base and url.startswith(cache_base + "/"):
+        return True
+
+    hostname = parsed.hostname.strip().lower()
+    if hostname in {"localhost", "localhost.localdomain", "metadata.google.internal"}:
+        return False
+
+    def _is_forbidden_ip(ip_str: str) -> bool:
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return True
+        return (
+            ip_obj.is_loopback
+            or ip_obj.is_private
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_unspecified
+            or ip_obj.is_reserved
+        )
+
+    try:
+        ipaddress.ip_address(hostname)
+        return not _is_forbidden_ip(hostname)
+    except ValueError:
+        pass
+
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except Exception:
+        return False
+
+    if not infos:
+        return False
+
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr or _is_forbidden_ip(str(sockaddr[0])):
+            return False
+    return True
+
+
 async def retrieve_image_data(url: str) -> Optional[bytes]:
     """Read image bytes from local /tmp cache or remote URL."""
     file_cache = getattr(generation_handler, "file_cache", None)
-    try:
-        if "/tmp/" in url and file_cache:
+    if "/tmp/" in url:
+        try:
             path = urlparse(url).path
-            filename = path.split("/tmp/")[-1]
-            local_file_path = file_cache.cache_dir / filename
+            raw_segment = path.split("/tmp/", 1)[-1]
+            if (
+                not raw_segment
+                or ".." in raw_segment
+                or "/" in raw_segment
+                or "\\" in raw_segment
+            ):
+                debug_logger.log_warning(f"[SECURITY] 拒绝非法缓存路径访问: {url}")
+                return None
+            if file_cache:
+                cache_root = file_cache.cache_dir.resolve()
+                safe_name = Path(raw_segment).name
+                if Path(safe_name).suffix.lower() not in _ALLOWED_CACHE_EXTENSIONS:
+                    return None
+                local_file_path = (cache_root / safe_name).resolve()
+                if (
+                    local_file_path.is_relative_to(cache_root)
+                    and local_file_path.exists()
+                    and local_file_path.is_file()
+                ):
+                    data = local_file_path.read_bytes()
+                    if data:
+                        return data
+        except Exception as exc:
+            debug_logger.log_warning(f"[CONTEXT] 本地缓存读取失败: {str(exc)}")
+        return None
 
-            if local_file_path.exists() and local_file_path.is_file():
-                data = local_file_path.read_bytes()
-                if data:
-                    return data
-    except Exception as exc:
-        debug_logger.log_warning(f"[CONTEXT] 本地缓存读取失败: {str(exc)}")
+    if not _is_safe_remote_media_url(url):
+        debug_logger.log_warning(f"[SECURITY] 拒绝访问不安全的远程媒体地址: {url}")
+        return None
 
     proxy_url = None
     try:
@@ -702,6 +796,11 @@ async def _build_gemini_success_payload(
             }
         ],
         "modelVersion": response_model,
+        "usageMetadata": {
+            "promptTokenCount": 100,
+            "candidatesTokenCount": 900,
+            "totalTokenCount": 1000,
+        },
     }
 
 
@@ -762,10 +861,19 @@ async def _iterate_openai_stream(
         video_media_id=normalized.video_media_id,
     ):
         if chunk.startswith("data: "):
+            payload_text = chunk[6:].strip()
+            if payload_text and payload_text != "[DONE]":
+                parsed = _parse_handler_result(payload_text)
+                if parsed.get("model") == "flow2api":
+                    parsed["model"] = normalized.model
+                    yield f"data: {json.dumps(parsed, ensure_ascii=False)}\n\n"
+                    continue
             yield chunk
             continue
 
         payload = _parse_handler_result(chunk)
+        if payload.get("model") == "flow2api":
+            payload["model"] = normalized.model
         yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     yield "data: [DONE]\n\n"
@@ -913,12 +1021,443 @@ async def create_chat_completion(
                 video_media_id=normalized.video_media_id,
             )
         )
+        if payload.get("model") == "flow2api":
+            payload["model"] = normalized.model
         return _build_openai_json_response(payload)
 
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+class OpenAIImageGenerationRequest(BaseModel):
+    """OpenAI-compatible /v1/images/generations and /v1/images/edits JSON request."""
+
+    model: Optional[str] = "gemini-3.1-flash-image"
+    prompt: str
+    n: Optional[int] = 1
+    size: Optional[str] = None
+    quality: Optional[str] = None
+    aspect_ratio: Optional[str] = None
+    aspectRatio: Optional[str] = None
+    image_size: Optional[str] = None
+    imageSize: Optional[str] = None
+    response_format: Optional[str] = "url"
+    image: Optional[Any] = None
+    images: Optional[List[Any]] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class VideoGenerationTaskRequest(BaseModel):
+    """Async video generation task submission payload for NewAPI / OpenAI video task adapters."""
+
+    model: Optional[str] = "omni-1.2-flash"
+    prompt: str
+    size: Optional[str] = None
+    quality: Optional[str] = None
+    aspect_ratio: Optional[str] = None
+    aspectRatio: Optional[str] = None
+    image_size: Optional[str] = None
+    imageSize: Optional[str] = None
+    image: Optional[Any] = None
+    images: Optional[List[Any]] = None
+    image_url: Optional[Any] = None
+    first_frame_image: Optional[str] = None
+    last_frame_image: Optional[str] = None
+    reference_images: Optional[List[Any]] = None
+    video_media_id: Optional[str] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+async def _extract_images_from_flexible_inputs(*raw_sources: Any) -> List[bytes]:
+    images: List[bytes] = []
+    for source in raw_sources:
+        if not source:
+            continue
+        items = source if isinstance(source, (list, tuple)) else [source]
+        for item in items:
+            if isinstance(item, (bytes, bytearray)):
+                if item:
+                    images.append(bytes(item))
+            elif isinstance(item, str):
+                uri = item.strip()
+                if not uri:
+                    continue
+                if uri.startswith(("data:image", "http://", "https://")) or "/tmp/" in uri:
+                    images.append(await _load_image_bytes_from_uri(uri))
+                else:
+                    images.append(base64.b64decode(uri))
+            elif isinstance(item, dict):
+                uri = (
+                    item.get("url")
+                    or (item.get("image_url") or {}).get("url")
+                    or item.get("b64_json")
+                    or item.get("data")
+                    or ""
+                )
+                if isinstance(uri, str) and uri.strip():
+                    uri = uri.strip()
+                    if uri.startswith(("data:image", "http://", "https://")) or "/tmp/" in uri:
+                        images.append(await _load_image_bytes_from_uri(uri))
+                    else:
+                        images.append(base64.b64decode(uri))
+    return images
+
+
+async def _build_openai_image_api_response(
+    *,
+    model: str,
+    prompt: str,
+    images: List[bytes],
+    response_format: Optional[str],
+    request_base_url: Optional[str],
+) -> JSONResponse:
+    payload = _enrich_payload_with_direct_url(
+        _parse_handler_result(
+            await _collect_non_stream_result(
+                model,
+                prompt,
+                images,
+                base_url_override=request_base_url,
+            )
+        )
+    )
+    if "error" in payload:
+        return _build_openai_json_response(payload)
+
+    url = _extract_url_from_openai_payload(payload)
+    if not url:
+        raise HTTPException(status_code=502, detail="Image generation returned no URL")
+
+    fmt = (response_format or "url").strip().lower()
+    item: Dict[str, Any] = {"revised_prompt": prompt}
+    if fmt == "b64_json":
+        if url.startswith("data:image"):
+            _, raw_bytes = _decode_data_url(url)
+            item["b64_json"] = base64.b64encode(raw_bytes).decode("ascii")
+        else:
+            image_bytes = await retrieve_image_data(url)
+            if not image_bytes:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Failed to fetch generated image for b64_json response",
+                )
+            item["b64_json"] = base64.b64encode(image_bytes).decode("ascii")
+    else:
+        item["url"] = url
+
+    return JSONResponse(
+        content={
+            "created": int(time.time()),
+            "data": [item],
+            "usage": {
+                "total_tokens": 1000,
+                "input_tokens": 100,
+                "output_tokens": 900,
+            },
+        }
+    )
+
+
+@router.post("/v1/images/generations")
+async def create_image_generation(
+    request: OpenAIImageGenerationRequest,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """OpenAI-compatible /v1/images/generations endpoint for NewAPI / OpenAI SDKs."""
+    prompt = _sanitize_media_prompt(request.prompt)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    images = await _extract_images_from_flexible_inputs(request.image, request.images)
+    requested_model = (request.model or "gemini-3.1-flash-image").strip()
+    if requested_model in {"dall-e-3", "dall-e-2", "gpt-image-1", "gpt-image-2"}:
+        requested_model = "gemini-3.1-flash-image"
+    resolved_model = _resolve_request_model(requested_model, request, images=images)
+    model_cfg = MODEL_CONFIG.get(resolved_model)
+    if not model_cfg or model_cfg.get("type") != "image":
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported image model: {request.model}"
+        )
+
+    return await _build_openai_image_api_response(
+        model=resolved_model,
+        prompt=prompt,
+        images=images,
+        response_format=request.response_format,
+        request_base_url=_get_request_base_url(raw_request),
+    )
+
+
+@router.post("/v1/images/edits")
+async def create_image_edit(
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """OpenAI-compatible /v1/images/edits endpoint (supports JSON and multipart/form-data)."""
+    content_type = (raw_request.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        body = await raw_request.json()
+        req = OpenAIImageGenerationRequest.model_validate(body)
+        images = await _extract_images_from_flexible_inputs(req.image, req.images)
+        prompt = _sanitize_media_prompt(req.prompt)
+        requested_model = (req.model or "gemini-3.1-flash-image").strip()
+        response_format = req.response_format
+        resolver_req: Any = req
+    else:
+        form = await raw_request.form()
+        prompt = _sanitize_media_prompt(str(form.get("prompt") or ""))
+        requested_model = str(form.get("model") or "gemini-3.1-flash-image").strip()
+        response_format = str(form.get("response_format") or "url").strip()
+        images: List[bytes] = []
+        for key in ("image", "image[]", "images", "images[]"):
+            for item in form.getlist(key):
+                if hasattr(item, "read"):
+                    data = await item.read()
+                    if data:
+                        images.append(data)
+                elif isinstance(item, str) and item.strip():
+                    images.extend(await _extract_images_from_flexible_inputs(item))
+        resolver_req = OpenAIImageGenerationRequest(
+            model=requested_model,
+            prompt=prompt or "edit",
+            size=str(form.get("size") or "") or None,
+            quality=str(form.get("quality") or "") or None,
+            aspect_ratio=str(form.get("aspect_ratio") or form.get("aspectRatio") or "")
+            or None,
+            image_size=str(form.get("image_size") or form.get("imageSize") or "")
+            or None,
+            response_format=response_format,
+        )
+
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+    if not images:
+        raise HTTPException(
+            status_code=400, detail="At least one reference image is required"
+        )
+    if requested_model in {"dall-e-3", "dall-e-2", "gpt-image-1", "gpt-image-2"}:
+        requested_model = "gemini-3.1-flash-image"
+    resolved_model = _resolve_request_model(
+        requested_model, resolver_req, images=images
+    )
+    model_cfg = MODEL_CONFIG.get(resolved_model)
+    if not model_cfg or model_cfg.get("type") != "image":
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported image model: {requested_model}"
+        )
+
+    return await _build_openai_image_api_response(
+        model=resolved_model,
+        prompt=prompt,
+        images=images,
+        response_format=response_format,
+        request_base_url=_get_request_base_url(raw_request),
+    )
+
+
+def _format_video_task_payload(task: Task) -> Dict[str, Any]:
+    urls = list(task.result_urls or [])
+    primary_url = urls[0] if urls else None
+    return {
+        "id": task.task_id,
+        "task_id": task.task_id,
+        "object": "video.generation.task",
+        "model": task.model,
+        "prompt": task.prompt,
+        "status": task.status,
+        "progress": task.progress,
+        "url": primary_url,
+        "video_url": primary_url,
+        "result_urls": urls,
+        "data": [{"url": u} for u in urls],
+        "error": {"message": task.error_message} if task.error_message else None,
+    }
+
+
+@router.post("/v1/video/generations")
+@router.post("/v1/videos/generations")
+async def create_video_generation_task(
+    request: VideoGenerationTaskRequest,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Submit an asynchronous video generation task for NewAPI / video task clients."""
+    handler = _ensure_generation_handler()
+    prompt = _sanitize_media_prompt(request.prompt)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    images = await _extract_images_from_flexible_inputs(
+        request.first_frame_image,
+        request.last_frame_image,
+        request.image,
+        request.images,
+        request.image_url,
+        request.reference_images,
+    )
+    requested_model = (request.model or "omni-1.2-flash").strip()
+    resolved_model = _resolve_request_model(requested_model, request, images=images)
+    model_cfg = MODEL_CONFIG.get(resolved_model)
+    if not model_cfg or model_cfg.get("type") != "video":
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported video model: {request.model}"
+        )
+
+    task_id = f"video-{uuid.uuid4().hex}"
+    task = Task(
+        task_id=task_id,
+        token_id=None,
+        model=resolved_model,
+        prompt=prompt,
+        status="processing",
+        progress=0,
+    )
+    _video_task_store[task_id] = task
+    if getattr(handler, "db", None) is not None:
+        try:
+            await handler.db.create_task(task)
+        except Exception as db_exc:
+            debug_logger.log_warning(f"[VIDEO_TASK] 创建任务记录降级为内存存储: {db_exc}")
+    request_base_url = _get_request_base_url(raw_request)
+
+    async def _persist_task_update(**fields: Any):
+        current = _video_task_store.get(task_id)
+        if current is not None:
+            for k, v in fields.items():
+                if hasattr(current, k) and v is not None:
+                    setattr(current, k, v)
+        if getattr(handler, "db", None) is not None:
+            try:
+                await handler.db.update_task(task_id, **fields)
+            except Exception:
+                pass
+
+    async def _run_task():
+        try:
+            raw_result = await _collect_non_stream_result(
+                resolved_model,
+                prompt,
+                images,
+                base_url_override=request_base_url,
+                video_media_id=request.video_media_id,
+            )
+            payload = _enrich_payload_with_direct_url(_parse_handler_result(raw_result))
+            if "error" in payload:
+                err_msg = (payload.get("error") or {}).get(
+                    "message", "Video generation failed"
+                )
+                await _persist_task_update(
+                    status="failed",
+                    error_message=str(err_msg),
+                    completed_at=time.time(),
+                )
+                return
+            video_url = _extract_url_from_openai_payload(payload)
+            if not video_url:
+                await _persist_task_update(
+                    status="failed",
+                    error_message="Video generation completed without a media URL",
+                    completed_at=time.time(),
+                )
+                return
+            await _persist_task_update(
+                status="completed",
+                progress=100,
+                result_urls=[video_url],
+                completed_at=time.time(),
+            )
+        except Exception as exc:
+            await _persist_task_update(
+                status="failed",
+                error_message=str(exc),
+                completed_at=time.time(),
+            )
+        finally:
+            _background_video_tasks.pop(task_id, None)
+
+    _background_video_tasks[task_id] = asyncio.create_task(_run_task())
+    return _format_video_task_payload(task)
+
+
+@router.get("/v1/video/generations/{task_id}")
+@router.get("/v1/videos/generations/{task_id}")
+@router.get("/v1/tasks/{task_id}")
+async def get_video_generation_task(
+    task_id: str,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Poll status and result URL of an asynchronous video generation task."""
+    handler = _ensure_generation_handler()
+    task = None
+    if getattr(handler, "db", None) is not None:
+        try:
+            task = await handler.db.get_task(task_id)
+        except Exception:
+            task = None
+    if task is None:
+        task = _video_task_store.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    return _format_video_task_payload(task)
+
+
+@router.get("/v1/pool/status")
+async def get_account_pool_status(
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Return account pool capacity, total Flow credits, tier breakdown, and cooldowns."""
+    handler = _ensure_generation_handler()
+    tokens = await handler.token_manager.get_all_tokens()
+    active_tokens = [t for t in tokens if t.is_active]
+    lb = handler.load_balancer
+    concurrency_mgr = getattr(handler, "concurrency_manager", None)
+    image_inflight_total = 0
+    video_inflight_total = 0
+    if concurrency_mgr is not None:
+        for t in active_tokens:
+            image_inflight_total += await concurrency_mgr.get_image_inflight(t.id)
+            video_inflight_total += await concurrency_mgr.get_video_inflight(t.id)
+
+    tier_counts = {"Ult": 0, "Pro": 0, "Free": 0}
+    image_Ready = 0
+    video_ready = 0
+    cooling_down = 0
+    total_credits = 0
+
+    for t in active_tokens:
+        total_credits += max(0, int(t.credits or 0))
+        tier_label = get_paygate_tier_label(
+            normalize_user_paygate_tier(t.user_paygate_tier)
+        )
+        tier_counts[tier_label] = tier_counts.get(tier_label, 0) + 1
+        in_img_cd = lb._in_quota_cooldown(t.id, "image", t.credits) if lb else False
+        in_vid_cd = lb._in_quota_cooldown(t.id, "video", t.credits) if lb else False
+        if in_img_cd or in_vid_cd:
+            cooling_down += 1
+        if t.image_enabled and not in_img_cd:
+            image_Ready += 1
+        if t.video_enabled and not in_vid_cd:
+            video_ready += 1
+
+    return {
+        "object": "pool.status",
+        "total_accounts": len(tokens),
+        "active_accounts": len(active_tokens),
+        "cooling_down_accounts": cooling_down,
+        "image_ready_accounts": image_Ready,
+        "video_ready_accounts": video_ready,
+        "total_credits": total_credits,
+        "tiers": tier_counts,
+        "concurrency": {
+            "image_inflight": image_inflight_total,
+            "video_inflight": video_inflight_total,
+        },
+    }
 
 
 @router.post("/v1beta/models/{model}:generateContent")

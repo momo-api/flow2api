@@ -25,10 +25,6 @@ from ..core.config import (
     normalize_captcha_method,
     normalize_yescaptcha_task_type,
     is_yes_style_captcha_method,
-    FLOW2API_TEAM_CAPTCHA_BASE_URL,
-    FLOW2API_TEAM_CAPTCHA_CLIENT_KEY,
-    FLOW2API_TEAM_CAPTCHA_METHOD,
-    FLOW2API_TEAM_CAPTCHA_TASK_TYPE,
 )
 from ..core.models import Token
 from ..core.browser_runtime_status import (
@@ -80,7 +76,6 @@ def _sanitize_refresh_result(text: Any) -> str:
 
 SUPPORTED_API_CAPTCHA_METHODS = {
     "yescaptcha",
-    FLOW2API_TEAM_CAPTCHA_METHOD,
     "captcharun",
     "twocaptcha",
     "capmonster",
@@ -465,13 +460,7 @@ async def _solve_recaptcha_with_api_service(
     enterprise: bool = False,
 ) -> Optional[str]:
     """使用当前配置的第三方打码服务获取 token。"""
-    if method == FLOW2API_TEAM_CAPTCHA_METHOD:
-        # Flow2API 团队打码：内置服务，地址与密钥固定。
-        client_key = FLOW2API_TEAM_CAPTCHA_CLIENT_KEY
-        base_url = FLOW2API_TEAM_CAPTCHA_BASE_URL
-        task_type = FLOW2API_TEAM_CAPTCHA_TASK_TYPE
-        min_score = get_yescaptcha_min_score(task_type)
-    elif method == "yescaptcha":
+    if method == "yescaptcha":
         client_key = config.yescaptcha_api_key
         base_url = config.yescaptcha_base_url
         task_type = config.yescaptcha_task_type
@@ -2196,9 +2185,6 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
     captcha_config = await db.get_captcha_config()
     return {
         "captcha_method": captcha_config.captcha_method,
-        "flow2api_team_base_url": FLOW2API_TEAM_CAPTCHA_BASE_URL,
-        "flow2api_team_client_key": _mask_token(FLOW2API_TEAM_CAPTCHA_CLIENT_KEY),
-        "flow2api_team_task_type": FLOW2API_TEAM_CAPTCHA_TASK_TYPE,
         "yescaptcha_api_key": captcha_config.yescaptcha_api_key,
         "yescaptcha_base_url": captcha_config.yescaptcha_base_url,
         "yescaptcha_task_type": captcha_config.yescaptcha_task_type,

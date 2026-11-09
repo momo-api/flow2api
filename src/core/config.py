@@ -13,27 +13,18 @@ YESCAPTCHA_TASK_TYPE_OPTIONS = {
     "RecaptchaV3TaskProxylessM1S9": 0.9,
 }
 
-# Flow2API 团队打码：内置服务，地址与密钥写死在代码里，不随配置/数据库改变。
-FLOW2API_TEAM_CAPTCHA_METHOD = "flow2api_team"
-FLOW2API_TEAM_CAPTCHA_BASE_URL = "https://captcha.haqimi.uk"
-FLOW2API_TEAM_CAPTCHA_CLIENT_KEY = "sk-flow-mint-2f9a7c1e4b8d6350"
-FLOW2API_TEAM_CAPTCHA_TASK_TYPE = "RecaptchaV3TaskProxylessM1S9"
-
 
 def normalize_captcha_method(method: Optional[str]) -> str:
     """把打码方式收敛到内置支持的取值（未知值原样转小写返回）。"""
     normalized = (method or "").strip().lower()
-    if normalized in {FLOW2API_TEAM_CAPTCHA_METHOD, "flow2api-team", "flow2apiteam"}:
-        return FLOW2API_TEAM_CAPTCHA_METHOD
+    if normalized in {"flow2api_team", "flow2api-team", "flow2apiteam"}:
+        return "yescaptcha"
     return normalized or "yescaptcha"
 
 
 def is_yes_style_captcha_method(method: Optional[str]) -> bool:
-    """Flow2API 团队打码与 YesCaptcha 共用 createTask/getTaskResult 协议。"""
-    return normalize_captcha_method(method) in {
-        "yescaptcha",
-        FLOW2API_TEAM_CAPTCHA_METHOD,
-    }
+    """判断是否为 YesCaptcha createTask/getTaskResult 协议。"""
+    return normalize_captcha_method(method) == "yescaptcha"
 
 
 def normalize_yescaptcha_task_type(task_type: Optional[str]) -> str:

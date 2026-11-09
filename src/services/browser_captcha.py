@@ -273,11 +273,8 @@ else:
             from playwright.async_api import async_playwright, Route, BrowserContext
 
             PLAYWRIGHT_AVAILABLE = True
-            # 检查并安装浏览器
-            _ensure_browser_installed()
         except ImportError as e:
             debug_logger.log_error(f"[BrowserCaptcha] playwright 导入失败: {e}")
-            print(f"[BrowserCaptcha] ❌ playwright 导入失败: {e}")
 
 
 # 配置

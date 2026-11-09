@@ -96,7 +96,7 @@ class Task(BaseModel):
 
     id: Optional[int] = None
     task_id: str  # Flow API返回的operation name
-    token_id: int
+    token_id: Optional[int] = None
     model: str
     prompt: str
     status: str  # processing, completed, failed
@@ -190,7 +190,7 @@ class CaptchaConfig(BaseModel):
 
     id: int = 1
     captcha_method: str = (
-        "yescaptcha"  # yescaptcha/flow2api_team/captcharun/twocaptcha/capsolver/ezcaptcha/browser/personal/remote_browser
+        "yescaptcha"  # yescaptcha/captcharun/twocaptcha/capsolver/ezcaptcha/browser/personal/remote_browser
     )
     yescaptcha_api_key: str = ""
     yescaptcha_base_url: str = "https://api.yescaptcha.com"

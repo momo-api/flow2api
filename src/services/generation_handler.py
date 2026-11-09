@@ -1817,6 +1817,7 @@ class GenerationHandler:
                     status_text="token_ready",
                     progress=15,
                 )
+                selected_token_id = token.id
                 ensure_at_started_at = time.time()
                 token = await self.token_manager.ensure_valid_token(token)
                 perf_trace["ensure_at_ms"] = int(
@@ -1825,6 +1826,15 @@ class GenerationHandler:
                 if not token:
                     error_msg = "Token AT无效或刷新失败"
                     debug_logger.log_error(f"[GENERATION] {error_msg}")
+                    failed_token_ids.add(selected_token_id)
+                    last_failover_error = error_msg
+                    failover_summary.append(f"#{selected_token_id} 登录态失效")
+                    if token_attempt < MAX_TOKEN_FAILOVER_ATTEMPTS - 1:
+                        if stream:
+                            yield self._create_stream_chunk(
+                                "当前账号登录态已失效，正在切换其他账号重试...\n"
+                            )
+                        continue
                     record_generation_result(
                         generation_type, "failed", time.time() - start_time
                     )
@@ -2184,7 +2194,6 @@ class GenerationHandler:
             "打码服务资源不足",
             "打码服务资源阻塞",
             "yescaptcha",
-            "flow2api_team",
             "capsolver",
             "captcharun",
             "twocaptcha",
@@ -2227,8 +2236,18 @@ class GenerationHandler:
         # 不在本地等待图片硬并发槽位；请求一到就直接向上游提交。
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
 
+        concurrency_mgr = getattr(self, "concurrency_manager", None)
+        acquired_image_slot = False
+        waited_ms = 0
+        if concurrency_mgr is not None:
+            acquired_image_slot, waited_ms = await concurrency_mgr.wait_acquire_image(
+                token.id,
+                timeout_seconds=config.flow_image_slot_wait_timeout,
+            )
+            if not acquired_image_slot:
+                raise RuntimeError("图片并发槽位等待超时")
         if image_trace is not None:
-            image_trace["slot_wait_ms"] = 0
+            image_trace["slot_wait_ms"] = int(waited_ms)
 
         if images and len(images) > 0:
             await self._update_request_log_progress(
@@ -2407,22 +2426,39 @@ class GenerationHandler:
                             }
 
                             if str(encoded_image).startswith("https://"):
-                                response_state["url"] = encoded_image
+                                final_upscaled_url = encoded_image
+                                if config.cache_enabled and getattr(
+                                    self, "file_cache", None
+                                ):
+                                    try:
+                                        cached_filename = (
+                                            await self.file_cache.download_and_cache(
+                                                encoded_image, "image"
+                                            )
+                                        )
+                                        final_upscaled_url = (
+                                            f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                                        )
+                                    except Exception as cache_err:
+                                        debug_logger.log_error(
+                                            f"Failed to cache upsampled image URL: {cache_err}"
+                                        )
+                                response_state["url"] = final_upscaled_url
                                 response_state["generated_assets"]["upscaled_image"][
                                     "url"
-                                ] = encoded_image
+                                ] = final_upscaled_url
                                 response_state["generated_assets"]["upscaled_image"][
                                     "delivery_mode"
                                 ] = "frontend_url"
                                 self._mark_generation_succeeded(generation_result)
                                 if stream:
                                     yield self._create_stream_chunk(
-                                        f"![Generated Image]({encoded_image})",
+                                        f"![Generated Image]({final_upscaled_url})",
                                         finish_reason="stop",
                                     )
                                 else:
                                     yield self._create_completion_response(
-                                        encoded_image,
+                                        final_upscaled_url,
                                         media_type="image",
                                     )
                                 if image_trace is not None:
@@ -2618,7 +2654,8 @@ class GenerationHandler:
                 )
 
         finally:
-            pass
+            if acquired_image_slot and concurrency_mgr is not None:
+                await concurrency_mgr.release_image(token.id)
 
     async def _handle_video_generation(
         self,
@@ -2648,8 +2685,18 @@ class GenerationHandler:
         # 不在本地等待视频硬并发槽位；请求一到就直接向上游提交。
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
 
+        concurrency_mgr = getattr(self, "concurrency_manager", None)
+        acquired_video_slot = False
+        waited_ms = 0
+        if concurrency_mgr is not None:
+            acquired_video_slot, waited_ms = await concurrency_mgr.wait_acquire_video(
+                token.id,
+                timeout_seconds=config.flow_video_slot_wait_timeout,
+            )
+            if not acquired_video_slot:
+                raise RuntimeError("视频并发槽位等待超时")
         if video_trace is not None:
-            video_trace["slot_wait_ms"] = 0
+            video_trace["slot_wait_ms"] = int(waited_ms)
 
         await self._update_request_log_progress(
             request_log_state,
@@ -2960,10 +3007,6 @@ class GenerationHandler:
 
             direct_video_url = str(result.get("video_url") or "").strip()
             if result.get("direct_media") and direct_video_url:
-                await self.token_manager.record_usage(token.id, is_video=True)
-                await self.token_manager.record_success(token.id)
-                if getattr(self, "load_balancer", None):
-                    self.load_balancer.clear_quota_cooldown(token.id, "video")
                 if self.proxy_manager and hasattr(
                     self.proxy_manager,
                     "record_attempt_success",
@@ -2974,11 +3017,24 @@ class GenerationHandler:
                         str(fingerprint.get("proxy_url") or "").strip(),
                     )
 
-                duration = time.time() - submit_started_at
-                response_state["url"] = direct_video_url
+                final_direct_url = direct_video_url
+                if config.cache_enabled and getattr(self, "file_cache", None):
+                    try:
+                        cached_filename = await self.file_cache.download_and_cache(
+                            direct_video_url, "video"
+                        )
+                        final_direct_url = (
+                            f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                        )
+                    except Exception as cache_err:
+                        debug_logger.log_error(
+                            f"Failed to cache direct video: {cache_err}"
+                        )
+
+                response_state["url"] = final_direct_url
                 response_state["generated_assets"] = {
                     "type": "video",
-                    "final_video_url": direct_video_url,
+                    "final_video_url": final_direct_url,
                     "delivery_mode": "frontend_direct_media",
                 }
                 await self._update_request_log_progress(
@@ -2987,42 +3043,15 @@ class GenerationHandler:
                     status_text="completed",
                     progress=100,
                 )
-                prompt_for_log = (
-                    prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
-                )
-                await self._log_request(
-                    token.id,
-                    "generate_video",
-                    {
-                        "model": model_key,
-                        "prompt": prompt_for_log,
-                        "delivery_mode": "frontend_direct_media",
-                    },
-                    {
-                        "status": "success",
-                        "model": model_key,
-                        "prompt": prompt_for_log,
-                        "url": direct_video_url,
-                        "performance": {
-                            "status": "success",
-                            "total_ms": int(duration * 1000),
-                        },
-                    },
-                    200,
-                    duration,
-                    log_id=request_log_state.get("id"),
-                    status_text="completed",
-                    progress=100,
-                )
                 self._mark_generation_succeeded(generation_result)
                 if stream:
                     yield self._create_stream_chunk(
-                        f"<video src='{direct_video_url}' controls style='max-width:100%'></video>",
+                        f"<video src='{final_direct_url}' controls style='max-width:100%'></video>",
                         finish_reason="stop",
                     )
                 else:
                     yield self._create_completion_response(
-                        direct_video_url,
+                        final_direct_url,
                         media_type="video",
                     )
                 return
@@ -3082,7 +3111,8 @@ class GenerationHandler:
                 yield chunk
 
         finally:
-            pass
+            if acquired_video_slot and concurrency_mgr is not None:
+                await concurrency_mgr.release_video(token.id)
 
     async def _poll_video_result(
         self,
@@ -3509,7 +3539,14 @@ class GenerationHandler:
                     "finish_reason": "stop",
                 }
             ],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 900,
+                "total_tokens": 1000,
+            },
         }
+        if not is_availability_check and content:
+            response["url"] = content
 
         return json.dumps(response, ensure_ascii=False)
 

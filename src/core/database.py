@@ -47,6 +47,8 @@ class Database:
     async def _configure_connection(self, db):
         """Apply SQLite runtime settings for better concurrent behavior."""
         await db.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+        await db.execute("PRAGMA journal_mode = WAL")
+        await db.execute("PRAGMA synchronous = NORMAL")
         await db.execute("PRAGMA foreign_keys = ON")
 
     def _current_stats_date(self) -> str:
@@ -826,7 +828,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS tasks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id TEXT UNIQUE NOT NULL,
-                    token_id INTEGER NOT NULL,
+                    token_id INTEGER,
                     model TEXT NOT NULL,
                     prompt TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'processing',
@@ -1332,6 +1334,38 @@ class Database:
 
     async def update_token(self, token_id: int, **kwargs):
         """Update token fields"""
+        allowed_fields = {
+            "st",
+            "at",
+            "at_expires",
+            "email",
+            "name",
+            "remark",
+            "is_active",
+            "last_used_at",
+            "use_count",
+            "credits",
+            "user_paygate_tier",
+            "current_project_id",
+            "current_project_name",
+            "image_enabled",
+            "video_enabled",
+            "image_concurrency",
+            "video_concurrency",
+            "captcha_proxy_url",
+            "extension_route_key",
+            "protocol_mode",
+            "google_cookies",
+            "login_account",
+            "login_password",
+            "proxy_url",
+            "auto_refresh_enabled",
+            "refresh_interval_minutes",
+            "last_st_refresh_at",
+            "last_st_refresh_result",
+            "ban_reason",
+            "banned_at",
+        }
         async with self._connect(write=True) as db:
             if "email" in kwargs or "login_account" in kwargs:
                 await db.execute("BEGIN IMMEDIATE")
@@ -1345,6 +1379,8 @@ class Database:
             params = []
 
             for key, value in kwargs.items():
+                if key not in allowed_fields:
+                    continue
                 updates.append(f"{key} = ?")
                 params.append(value)
 
@@ -1476,11 +1512,24 @@ class Database:
 
     async def update_task(self, task_id: str, **kwargs):
         """Update task"""
+        allowed_fields = {
+            "token_id",
+            "model",
+            "prompt",
+            "status",
+            "progress",
+            "result_urls",
+            "error_message",
+            "scene_id",
+            "completed_at",
+        }
         async with self._connect(write=True) as db:
             updates = []
             params = []
 
             for key, value in kwargs.items():
+                if key not in allowed_fields:
+                    continue
                 if value is not None:
                     # Convert list to JSON string for result_urls
                     if key == "result_urls" and isinstance(value, list):

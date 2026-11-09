@@ -387,11 +387,17 @@ class FileCache:
                     env = None
 
                 wget_cmd.append(url)
-                result = subprocess.run(
-                    wget_cmd, capture_output=True, timeout=90, env=env
+                proc = await asyncio.create_subprocess_exec(
+                    *wget_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+                _, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=90
                 )
 
-                if result.returncode == 0 and file_path.exists():
+                if proc.returncode == 0 and file_path.exists():
                     file_size = file_path.stat().st_size
                     if file_size > 0:
                         debug_logger.log_info(
@@ -401,8 +407,8 @@ class FileCache:
                     raise Exception("Downloaded file is empty")
 
                 error_msg = (
-                    result.stderr.decode("utf-8", errors="ignore")
-                    if result.stderr
+                    stderr_bytes.decode("utf-8", errors="ignore")
+                    if stderr_bytes
                     else "Unknown error"
                 )
                 debug_logger.log_warning(f"wget failed: {error_msg}, trying curl...")
@@ -450,9 +456,16 @@ class FileCache:
                     curl_cmd.extend(["-x", proxy_url])
 
                 curl_cmd.append(url)
-                result = subprocess.run(curl_cmd, capture_output=True, timeout=90)
+                proc = await asyncio.create_subprocess_exec(
+                    *curl_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=90
+                )
 
-                if result.returncode == 0 and file_path.exists():
+                if proc.returncode == 0 and file_path.exists():
                     file_size = file_path.stat().st_size
                     if file_size > 0:
                         debug_logger.log_info(
@@ -462,8 +475,8 @@ class FileCache:
                     raise Exception("Downloaded file is empty")
 
                 error_msg = (
-                    result.stderr.decode("utf-8", errors="ignore")
-                    if result.stderr
+                    stderr_bytes.decode("utf-8", errors="ignore")
+                    if stderr_bytes
                     else "Unknown error"
                 )
                 raise Exception(f"curl command failed: {error_msg}")

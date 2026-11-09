@@ -220,7 +220,11 @@ class CurrentFlowClientMixin:
         return {
             "credits": credits,
             "userPaygateTier": (
-                "PAYGATE_TIER_ONE" if credits > 0 else "PAYGATE_TIER_NOT_PAID"
+                "PAYGATE_TIER_TWO"
+                if credits > 1000
+                else "PAYGATE_TIER_ONE"
+                if credits > 0
+                else "PAYGATE_TIER_NOT_PAID"
             ),
             "frontendRpc": "nzlxg",
         }
@@ -869,7 +873,12 @@ class CurrentFlowClientMixin:
         normalized = self._normalize_frontend_video_status(payload, operations)
         checked_operations = normalized.get("operations") or []
         for operation in checked_operations:
-            if "SUCCESSFUL" in str(operation.get("status") or ""):
+            status_str = str(operation.get("status") or "")
+            if (
+                "SUCCESSFUL" in status_str
+                or "FAILED" in status_str
+                or "ERROR" in status_str
+            ):
                 continue
             operation_body = operation.get("operation") or {}
             metadata = operation_body.get("metadata") or {}
