@@ -21,10 +21,11 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from ..core.auth import AuthManager, verify_api_key_flexible
@@ -145,7 +146,7 @@ def _build_model_description(model_config: Dict[str, Any]) -> str:
 
 def _get_openai_model_catalog() -> List[Dict[str, str]]:
     """Collect OpenAI-compatible model list entries."""
-    return [
+    entries = [
         {
             "id": model_id,
             "description": _build_model_description(model_config),
@@ -153,16 +154,32 @@ def _get_openai_model_catalog() -> List[Dict[str, str]]:
         for model_id, model_config in MODEL_CONFIG.items()
         if model_config.get("listed", True)
     ]
+    seen = {item["id"] for item in entries}
+    newapi_aliases = [
+        ("gemini-3.1-flash-image", "Nano Banana 2.1 (Image Generation)"),
+        ("gemini-3.1-flash-lite-image", "Nano Banana 2 Lite (Image Generation)"),
+        ("gemini-3.0-pro-image", "Nano Banana Pro (Image Generation)"),
+        ("imagen-3.0-generate-002", "Google Imagen / Nano Banana 2.1 (:predict)"),
+        ("veo-3.1-generate-preview", "Google Veo 3.1 Quality (NewAPI google plugin)"),
+        ("veo-3.1-fast-generate-preview", "Google Veo 3.1 Fast (NewAPI google plugin)"),
+        ("veo-3.0-generate-001", "Google Veo 3.0 Quality alias"),
+        ("veo-3.0-fast-generate-001", "Google Veo 3.0 Fast alias"),
+        ("sora-2", "OpenAI Sora-2 compatible video alias (Omni 1.2 Flash)"),
+        ("sora-2-pro", "OpenAI Sora-2-Pro compatible video alias (Veo 3.1 Quality)"),
+    ]
+    for model_id, desc in newapi_aliases:
+        if model_id not in seen:
+            entries.append({"id": model_id, "description": desc})
+            seen.add(model_id)
+    return entries
 
 
 def _get_gemini_model_catalog() -> Dict[str, str]:
     """Collect Gemini-compatible model metadata for /models endpoints."""
     catalog: Dict[str, str] = {}
 
-    for model_id, model_config in MODEL_CONFIG.items():
-        if not model_config.get("listed", True):
-            continue
-        catalog.setdefault(model_id, _build_model_description(model_config))
+    for item in _get_openai_model_catalog():
+        catalog.setdefault(item["id"], item["description"])
 
     return catalog
 
@@ -1263,51 +1280,55 @@ async def create_image_edit(
 def _format_video_task_payload(task: Task) -> Dict[str, Any]:
     urls = list(task.result_urls or [])
     primary_url = urls[0] if urls else None
+    raw_status = (task.status or "processing").strip().lower()
+    openai_video_status = (
+        "completed"
+        if raw_status == "completed"
+        else "failed"
+        if raw_status == "failed"
+        else "in_progress"
+        if (task.progress or 0) > 0
+        else "processing"
+    )
+    duration_match = re.search(r"-(\d+)s-", str(task.model or ""))
+    duration_seconds = int(duration_match.group(1)) if duration_match else 8
+    size_str = "720x1280" if "portrait" in str(task.model or "") else "1280x720"
     return {
         "id": task.task_id,
         "task_id": task.task_id,
-        "object": "video.generation.task",
+        "object": "video",
         "model": task.model,
         "prompt": task.prompt,
-        "status": task.status,
+        "status": openai_video_status,
         "progress": task.progress,
+        "seconds": duration_seconds,
+        "duration": duration_seconds,
+        "size": size_str,
+        "created_at": int(task.created_at.timestamp())
+        if hasattr(task.created_at, "timestamp")
+        else int(time.time()),
         "url": primary_url,
         "video_url": primary_url,
         "result_urls": urls,
         "data": [{"url": u} for u in urls],
-        "error": {"message": task.error_message} if task.error_message else None,
+        "error": {
+            "code": "video_generation_failed",
+            "message": task.error_message,
+        }
+        if task.error_message
+        else None,
     }
 
 
-@router.post("/v1/video/generations")
-@router.post("/v1/videos/generations")
-async def create_video_generation_task(
-    request: VideoGenerationTaskRequest,
-    raw_request: Request,
-    api_key: str = Depends(verify_api_key_flexible),
-):
-    """Submit an asynchronous video generation task for NewAPI / video task clients."""
+async def _start_async_video_task(
+    *,
+    resolved_model: str,
+    prompt: str,
+    images: List[bytes],
+    request_base_url: Optional[str],
+    video_media_id: Optional[str] = None,
+) -> Task:
     handler = _ensure_generation_handler()
-    prompt = _sanitize_media_prompt(request.prompt)
-    if not prompt:
-        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
-
-    images = await _extract_images_from_flexible_inputs(
-        request.first_frame_image,
-        request.last_frame_image,
-        request.image,
-        request.images,
-        request.image_url,
-        request.reference_images,
-    )
-    requested_model = (request.model or "omni-1.2-flash").strip()
-    resolved_model = _resolve_request_model(requested_model, request, images=images)
-    model_cfg = MODEL_CONFIG.get(resolved_model)
-    if not model_cfg or model_cfg.get("type") != "video":
-        raise HTTPException(
-            status_code=400, detail=f"Unsupported video model: {request.model}"
-        )
-
     task_id = f"video-{uuid.uuid4().hex}"
     task = Task(
         task_id=task_id,
@@ -1323,7 +1344,6 @@ async def create_video_generation_task(
             await handler.db.create_task(task)
         except Exception as db_exc:
             debug_logger.log_warning(f"[VIDEO_TASK] 创建任务记录降级为内存存储: {db_exc}")
-    request_base_url = _get_request_base_url(raw_request)
 
     async def _persist_task_update(**fields: Any):
         current = _video_task_store.get(task_id)
@@ -1344,7 +1364,7 @@ async def create_video_generation_task(
                 prompt,
                 images,
                 base_url_override=request_base_url,
-                video_media_id=request.video_media_id,
+                video_media_id=video_media_id,
             )
             payload = _enrich_payload_with_direct_url(_parse_handler_result(raw_result))
             if "error" in payload:
@@ -1381,9 +1401,129 @@ async def create_video_generation_task(
             _background_video_tasks.pop(task_id, None)
 
     _background_video_tasks[task_id] = asyncio.create_task(_run_task())
+    return task
+
+
+async def _lookup_video_task(task_id: str) -> Optional[Task]:
+    handler = _ensure_generation_handler()
+    normalized_id = str(task_id or "").strip()
+    if "/" in normalized_id:
+        normalized_id = normalized_id.rsplit("/", 1)[-1]
+    task = None
+    if getattr(handler, "db", None) is not None:
+        try:
+            task = await handler.db.get_task(normalized_id)
+        except Exception:
+            task = None
+    if task is None:
+        task = _video_task_store.get(normalized_id)
+    return task
+
+
+@router.post("/v1/videos")
+@router.post("/v1/video/generations")
+@router.post("/v1/videos/generations")
+async def create_video_generation_task(
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Submit an asynchronous video task (supports JSON and multipart/form-data for NewAPI sora/openai_video)."""
+    content_type = (raw_request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in content_type:
+        form = await raw_request.form()
+        prompt = _sanitize_media_prompt(str(form.get("prompt") or ""))
+        requested_model = str(form.get("model") or "omni-1.2-flash").strip()
+        images: List[bytes] = []
+        for key in ("input_reference", "image", "image[]", "images", "images[]"):
+            for item in form.getlist(key):
+                if hasattr(item, "read"):
+                    data = await item.read()
+                    if data:
+                        images.append(data)
+                elif isinstance(item, str) and item.strip():
+                    images.extend(await _extract_images_from_flexible_inputs(item))
+        metadata_raw = form.get("metadata")
+        metadata_obj = None
+        if isinstance(metadata_raw, str) and metadata_raw.strip():
+            try:
+                metadata_obj = json.loads(metadata_raw)
+            except Exception:
+                metadata_obj = None
+        req = VideoGenerationTaskRequest(
+            model=requested_model,
+            prompt=prompt or "video",
+            size=str(form.get("size") or "") or None,
+            quality=str(form.get("quality") or "") or None,
+            aspect_ratio=str(form.get("aspect_ratio") or form.get("aspectRatio") or "")
+            or None,
+            image_size=str(form.get("image_size") or form.get("imageSize") or form.get("resolution") or "")
+            or None,
+            video_media_id=str(form.get("video_media_id") or "") or None,
+            seconds=form.get("seconds") or form.get("duration"),
+            metadata=metadata_obj,
+        )
+    else:
+        body = await raw_request.json()
+        req = VideoGenerationTaskRequest.model_validate(body)
+        prompt = _sanitize_media_prompt(req.prompt)
+        requested_model = (req.model or "omni-1.2-flash").strip()
+        images = await _extract_images_from_flexible_inputs(
+            req.first_frame_image,
+            req.last_frame_image,
+            getattr(req, "input_reference", None),
+            req.image,
+            req.images,
+            req.image_url,
+            req.reference_images,
+        )
+
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    resolved_model = _resolve_request_model(requested_model, req, images=images)
+    model_cfg = MODEL_CONFIG.get(resolved_model)
+    if not model_cfg or model_cfg.get("type") != "video":
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported video model: {requested_model}"
+        )
+
+    task = await _start_async_video_task(
+        resolved_model=resolved_model,
+        prompt=prompt,
+        images=images,
+        request_base_url=_get_request_base_url(raw_request),
+        video_media_id=req.video_media_id,
+    )
     return _format_video_task_payload(task)
 
 
+@router.post("/v1/videos/{video_id}/remix")
+async def remix_video_generation_task(
+    video_id: str,
+    request: VideoGenerationTaskRequest,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """OpenAI /v1/videos/{video_id}/remix endpoint for NewAPI sora plugin."""
+    prompt = _sanitize_media_prompt(request.prompt)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+    requested_model = (request.model or "omni-1.2-flash").strip()
+    resolved_model = _resolve_request_model(requested_model, request, images=[])
+    model_cfg = MODEL_CONFIG.get(resolved_model)
+    if not model_cfg or model_cfg.get("type") != "video":
+        resolved_model = "omni-1.2-flash-8s-landscape"
+    task = await _start_async_video_task(
+        resolved_model=resolved_model,
+        prompt=prompt,
+        images=[],
+        request_base_url=_get_request_base_url(raw_request),
+        video_media_id=request.video_media_id,
+    )
+    return _format_video_task_payload(task)
+
+
+@router.get("/v1/videos/{task_id}")
 @router.get("/v1/video/generations/{task_id}")
 @router.get("/v1/videos/generations/{task_id}")
 @router.get("/v1/tasks/{task_id}")
@@ -1392,18 +1532,65 @@ async def get_video_generation_task(
     api_key: str = Depends(verify_api_key_flexible),
 ):
     """Poll status and result URL of an asynchronous video generation task."""
-    handler = _ensure_generation_handler()
-    task = None
-    if getattr(handler, "db", None) is not None:
-        try:
-            task = await handler.db.get_task(task_id)
-        except Exception:
-            task = None
-    if task is None:
-        task = _video_task_store.get(task_id)
+    task = await _lookup_video_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     return _format_video_task_payload(task)
+
+
+@router.api_route("/v1/videos/{task_id}/content", methods=["GET", "HEAD"])
+@router.api_route(
+    "/v1/tasks/{task_id}/artifacts/video/content", methods=["GET", "HEAD"]
+)
+async def get_video_generation_content(
+    task_id: str,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Serve or proxy the generated MP4 video content for NewAPI rc.47 task artifact downloads."""
+    handler = _ensure_generation_handler()
+    task = await _lookup_video_task(task_id)
+    if not task or not task.result_urls:
+        raise HTTPException(
+            status_code=404, detail=f"Video artifact not available for task: {task_id}"
+        )
+    video_url = str(task.result_urls[0] or "").strip()
+    if not video_url:
+        raise HTTPException(status_code=404, detail="Empty video URL")
+
+    file_cache = getattr(handler, "file_cache", None)
+    if "/tmp/" in video_url and file_cache:
+        raw_segment = urlparse(video_url).path.split("/tmp/", 1)[-1]
+        safe_name = Path(raw_segment).name
+        local_path = (file_cache.cache_dir.resolve() / safe_name).resolve()
+        if (
+            local_path.is_relative_to(file_cache.cache_dir.resolve())
+            and local_path.is_file()
+        ):
+            if raw_request.method == "HEAD":
+                return Response(
+                    status_code=200,
+                    media_type="video/mp4",
+                    headers={"Content-Length": str(local_path.stat().st_size)},
+                )
+            return FileResponse(str(local_path), media_type="video/mp4")
+
+    if file_cache and hasattr(file_cache, "download_and_cache"):
+        try:
+            cached_name = await file_cache.download_and_cache(video_url, "video")
+            local_path = (file_cache.cache_dir.resolve() / cached_name).resolve()
+            if local_path.is_file():
+                if raw_request.method == "HEAD":
+                    return Response(
+                        status_code=200,
+                        media_type="video/mp4",
+                        headers={"Content-Length": str(local_path.stat().st_size)},
+                    )
+                return FileResponse(str(local_path), media_type="video/mp4")
+        except Exception as exc:
+            debug_logger.log_warning(f"[VIDEO_CONTENT] 代理缓存视频失败，回退重定向: {exc}")
+
+    return RedirectResponse(url=video_url, status_code=302)
 
 
 @router.get("/v1/pool/status")
@@ -1458,6 +1645,249 @@ async def get_account_pool_status(
             "video_inflight": video_inflight_total,
         },
     }
+
+
+@router.post("/v1beta/models/{model}:predict")
+@router.post("/models/{model}:predict")
+async def gemini_predict_image(
+    model: str,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Gemini Imagen :predict endpoint for NewAPI rc.47 Gemini Channel (Type 24) image generation."""
+    body = await raw_request.json()
+    instances = body.get("instances") if isinstance(body, dict) else None
+    if not isinstance(instances, list) or not instances:
+        return JSONResponse(
+            status_code=400,
+            content=_build_gemini_error_payload(400, "instances is required"),
+        )
+    first_inst = instances[0] if isinstance(instances[0], dict) else {}
+    prompt = _sanitize_media_prompt(str(first_inst.get("prompt") or ""))
+    if not prompt:
+        return JSONResponse(
+            status_code=400,
+            content=_build_gemini_error_payload(400, "prompt cannot be empty"),
+        )
+    params = body.get("parameters") if isinstance(body.get("parameters"), dict) else {}
+    req = OpenAIImageGenerationRequest(
+        model=model,
+        prompt=prompt,
+        aspect_ratio=str(params.get("aspectRatio") or "") or None,
+        image_size=str(params.get("imageSize") or "") or None,
+        response_format="b64_json",
+    )
+    target_model = model if model in MODEL_CONFIG else "gemini-3.1-flash-image"
+    resolved_model = _resolve_request_model(target_model, req, images=[])
+    request_base_url = _get_request_base_url(raw_request)
+    payload = _enrich_payload_with_direct_url(
+        _parse_handler_result(
+            await _collect_non_stream_result(
+                resolved_model,
+                prompt,
+                [],
+                base_url_override=request_base_url,
+            )
+        )
+    )
+    if "error" in payload:
+        return _build_gemini_error_response_from_handler(payload)
+    url = _extract_url_from_openai_payload(payload)
+    if not url:
+        return JSONResponse(
+            status_code=502,
+            content=_build_gemini_error_payload(502, "No image generated"),
+        )
+    if url.startswith("data:image"):
+        mime_type, raw_bytes = _decode_data_url(url)
+        b64_data = base64.b64encode(raw_bytes).decode("ascii")
+    else:
+        image_bytes = await retrieve_image_data(url)
+        if not image_bytes:
+            return JSONResponse(
+                status_code=502,
+                content=_build_gemini_error_payload(
+                    502, "Failed to retrieve generated image bytes"
+                ),
+            )
+        mime_type = _detect_image_mime_type(image_bytes)
+        b64_data = base64.b64encode(image_bytes).decode("ascii")
+
+    return JSONResponse(
+        content={
+            "predictions": [
+                {
+                    "bytesBase64Encoded": b64_data,
+                    "mimeType": mime_type,
+                }
+            ]
+        }
+    )
+
+
+@router.post("/v1beta/models/{model}:predictLongRunning")
+@router.post("/models/{model}:predictLongRunning")
+@router.post("/google/v1beta/models/{model}:predictLongRunning")
+async def gemini_predict_long_running_video(
+    model: str,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Gemini Veo :predictLongRunning endpoint for NewAPI rc.47 built-in google video task plugin."""
+    body = await raw_request.json()
+    instances = body.get("instances") if isinstance(body, dict) else None
+    if not isinstance(instances, list) or not instances:
+        return JSONResponse(
+            status_code=400,
+            content=_build_gemini_error_payload(400, "instances is required"),
+        )
+    first_inst = instances[0] if isinstance(instances[0], dict) else {}
+    prompt = _sanitize_media_prompt(str(first_inst.get("prompt") or ""))
+    images: List[bytes] = []
+    image_obj = first_inst.get("image")
+    if isinstance(image_obj, dict):
+        inline = image_obj.get("inlineData") or image_obj.get("inline_data")
+        if isinstance(inline, dict) and inline.get("data"):
+            images.append(base64.b64decode(str(inline["data"])))
+        elif image_obj.get("bytesBase64Encoded"):
+            images.append(base64.b64decode(str(image_obj["bytesBase64Encoded"])))
+        elif image_obj.get("uri") or image_obj.get("fileUri"):
+            images.append(
+                await _load_image_bytes_from_uri(
+                    str(image_obj.get("uri") or image_obj.get("fileUri"))
+                )
+            )
+
+    if not prompt and not images:
+        return JSONResponse(
+            status_code=400,
+            content=_build_gemini_error_payload(400, "prompt is required"),
+        )
+    params = body.get("parameters") if isinstance(body.get("parameters"), dict) else {}
+    req = VideoGenerationTaskRequest(
+        model=model,
+        prompt=prompt or "animate this image",
+        aspect_ratio=str(params.get("aspectRatio") or "") or None,
+        image_size=str(params.get("resolution") or "") or None,
+        duration=params.get("durationSeconds") or params.get("duration"),
+        parameters=params,
+    )
+    resolved_model = _resolve_request_model(model, req, images=images)
+    model_cfg = MODEL_CONFIG.get(resolved_model)
+    if not model_cfg or model_cfg.get("type") != "video":
+        resolved_model = _resolve_request_model("omni-1.2-flash", req, images=images)
+
+    task = await _start_async_video_task(
+        resolved_model=resolved_model,
+        prompt=prompt or "animate this image",
+        images=images,
+        request_base_url=_get_request_base_url(raw_request),
+    )
+    return JSONResponse(
+        content={
+            "name": f"models/{model}/operations/{task.task_id}",
+            "done": False,
+            "metadata": {
+                "@type": "type.googleapis.com/google.ai.generativelanguage.v1beta.PredictLongRunningMetadata",
+                "progress": 0,
+            },
+        }
+    )
+
+
+def _format_gemini_operation_payload(
+    task: Task,
+    model_name: str,
+    request_base_url: Optional[str],
+) -> Dict[str, Any]:
+    op_name = f"models/{model_name}/operations/{task.task_id}"
+    status = (task.status or "processing").strip().lower()
+    if status == "failed":
+        return {
+            "name": op_name,
+            "done": True,
+            "error": {
+                "code": 500,
+                "message": task.error_message or "Video generation failed",
+            },
+        }
+    if status == "completed":
+        urls = list(task.result_urls or [])
+        direct_url = urls[0] if urls else ""
+        content_url = (
+            f"{request_base_url.rstrip('/')}/v1/videos/{task.task_id}/content"
+            if request_base_url
+            else direct_url
+        )
+        return {
+            "name": op_name,
+            "done": True,
+            "response": {
+                "@type": "type.googleapis.com/google.ai.generativelanguage.v1beta.PredictLongRunningResponse",
+                "uri": content_url,
+                "videos": [{"uri": content_url, "mimeType": "video/mp4"}],
+                "generateVideoResponse": {
+                    "generatedVideos": [
+                        {"video": {"uri": content_url, "mimeType": "video/mp4"}}
+                    ],
+                    "generatedSamples": [
+                        {"video": {"uri": content_url, "mimeType": "video/mp4"}}
+                    ],
+                },
+            },
+        }
+    return {
+        "name": op_name,
+        "done": False,
+        "metadata": {
+            "progress": int(task.progress or 0),
+        },
+    }
+
+
+@router.get("/v1beta/models/{model}/operations/{task_id}")
+@router.get("/models/{model}/operations/{task_id}")
+@router.get("/google/v1beta/models/{model}/operations/{task_id}")
+async def get_gemini_model_operation(
+    model: str,
+    task_id: str,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Poll a Gemini Veo long-running operation by model and task_id."""
+    task = await _lookup_video_task(task_id)
+    if not task:
+        return JSONResponse(
+            status_code=404,
+            content=_build_gemini_error_payload(404, f"Operation not found: {task_id}"),
+        )
+    return JSONResponse(
+        content=_format_gemini_operation_payload(
+            task, model, _get_request_base_url(raw_request)
+        )
+    )
+
+
+@router.get("/v1beta/operations/{task_id}")
+@router.get("/operations/{task_id}")
+@router.get("/google/v1beta/operations/{task_id}")
+async def get_gemini_operation(
+    task_id: str,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Poll a Gemini Veo long-running operation by task_id."""
+    task = await _lookup_video_task(task_id)
+    if not task:
+        return JSONResponse(
+            status_code=404,
+            content=_build_gemini_error_payload(404, f"Operation not found: {task_id}"),
+        )
+    return JSONResponse(
+        content=_format_gemini_operation_payload(
+            task, task.model or "veo-3.1-fast-generate-preview", _get_request_base_url(raw_request)
+        )
+    )
 
 
 @router.post("/v1beta/models/{model}:generateContent")

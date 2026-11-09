@@ -25,10 +25,11 @@ from src.core.account_tiers import (
 from src.core.auth import verify_api_key_flexible
 from src.core.config import config, normalize_captcha_method
 from src.core.database import Database
+from src.core.model_resolver import resolve_model_name
 from src.core.models import Token
 from src.services.concurrency_manager import ConcurrencyManager
 from src.services.flow_client import FlowClient
-from src.services.generation_handler import GenerationHandler
+from src.services.generation_handler import GenerationHandler, MODEL_CONFIG
 from src.services.load_balancer import LoadBalancer
 
 
@@ -430,6 +431,154 @@ class NewApiRoutesCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data["total_credits"], 20000)
             self.assertEqual(data["tiers"]["Ult"], 1)
 
+    def test_newapi_rc47_model_resolver_aliases(self):
+        req_veo = SimpleNamespace(
+            duration=6,
+            aspect_ratio="9:16",
+            image_size=None,
+        )
+        self.assertEqual(
+            resolve_model_name(
+                "veo-3.1-fast-generate-preview",
+                request=req_veo,
+                model_config=MODEL_CONFIG,
+            ),
+            "veo-3.1-fast-6s-portrait",
+        )
+        self.assertEqual(
+            resolve_model_name(
+                "veo-3.1-generate-preview",
+                request=req_veo,
+                model_config=MODEL_CONFIG,
+            ),
+            "veo-3.1-quality-6s-portrait",
+        )
+        req_omni = SimpleNamespace(
+            seconds=12,
+            aspect_ratio="9:16",
+            image_size=None,
+        )
+        self.assertEqual(
+            resolve_model_name(
+                "sora-2",
+                request=req_omni,
+                model_config=MODEL_CONFIG,
+            ),
+            "omni-1.2-flash-12s-portrait",
+        )
+        req_imagen = SimpleNamespace(
+            aspect_ratio="1:1",
+            image_size="2K",
+        )
+        self.assertEqual(
+            resolve_model_name(
+                "imagen-3.0-generate-002",
+                request=req_imagen,
+                model_config=MODEL_CONFIG,
+            ),
+            "gemini-3.1-flash-image-square-2k",
+        )
+
+    async def test_newapi_rc47_gemini_predict_and_veo_predict_long_running(self):
+        png_bytes = _make_png_bytes(64, 64)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app), base_url="http://localhost"
+        ) as client:
+            with patch.object(
+                routes, "retrieve_image_data", AsyncMock(return_value=png_bytes)
+            ):
+                predict_resp = await client.post(
+                    "/v1beta/models/imagen-3.0-generate-002:predict",
+                    json={
+                        "instances": [{"prompt": "A golden retriever"}],
+                        "parameters": {
+                            "sampleCount": 1,
+                            "aspectRatio": "1:1",
+                            "imageSize": "2K",
+                        },
+                    },
+                )
+            self.assertEqual(predict_resp.status_code, 200)
+            predictions = predict_resp.json()["predictions"]
+            self.assertEqual(len(predictions), 1)
+            self.assertEqual(
+                base64.b64decode(predictions[0]["bytesBase64Encoded"]), png_bytes
+            )
+
+            # NewAPI rc.47 google task plugin: POST :predictLongRunning + GET /operations/{id}
+            veo_submit = await client.post(
+                "/v1beta/models/veo-3.1-fast-generate-preview:predictLongRunning",
+                json={
+                    "instances": [{"prompt": "Ocean waves crashing at sunset"}],
+                    "parameters": {
+                        "durationSeconds": 6,
+                        "aspectRatio": "16:9",
+                        "resolution": "720p",
+                    },
+                },
+            )
+            self.assertEqual(veo_submit.status_code, 200)
+            op_body = veo_submit.json()
+            self.assertTrue(
+                op_body["name"].startswith(
+                    "models/veo-3.1-fast-generate-preview/operations/video-"
+                )
+            )
+            await asyncio.sleep(0.05)
+
+            op_poll = await client.get(f"/v1beta/{op_body['name']}")
+            self.assertEqual(op_poll.status_code, 200)
+            polled_op = op_poll.json()
+            self.assertTrue(polled_op["done"])
+            gen_videos = polled_op["response"]["generateVideoResponse"][
+                "generatedVideos"
+            ]
+            self.assertTrue(
+                gen_videos[0]["video"]["uri"].endswith("/content")
+            )
+
+    async def test_newapi_rc47_sora_videos_multipart_and_content_download(self):
+        png_bytes = _make_png_bytes(64, 64)
+        fake_mp4 = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+        cache_dir = Path(self.tmpdir.name) / "tmp"
+        cache_dir.mkdir(exist_ok=True)
+        (cache_dir / "cached_video.mp4").write_bytes(fake_mp4)
+        self.handler.file_cache = SimpleNamespace(
+            cache_dir=cache_dir,
+            download_and_cache=AsyncMock(return_value="cached_video.mp4"),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app), base_url="http://localhost"
+        ) as client:
+            submit_resp = await client.post(
+                "/v1/videos",
+                data={
+                    "model": "sora-2",
+                    "prompt": "Animate this character",
+                    "seconds": "8",
+                    "size": "1280x720",
+                },
+                files={"input_reference": ("ref.png", png_bytes, "image/png")},
+            )
+            self.assertEqual(submit_resp.status_code, 200)
+            task_id = submit_resp.json()["id"]
+            await asyncio.sleep(0.05)
+
+            status_resp = await client.get(f"/v1/videos/{task_id}")
+            self.assertEqual(status_resp.status_code, 200)
+            self.assertEqual(status_resp.json()["status"], "completed")
+
+            content_resp = await client.get(f"/v1/videos/{task_id}/content")
+            self.assertEqual(content_resp.status_code, 200)
+            self.assertEqual(content_resp.content, fake_mp4)
+            self.assertEqual(content_resp.headers["content-type"], "video/mp4")
+
+            artifact_resp = await client.get(
+                f"/v1/tasks/{task_id}/artifacts/video/content"
+            )
+            self.assertEqual(artifact_resp.status_code, 200)
+            self.assertEqual(artifact_resp.content, fake_mp4)
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,12 @@ IMAGE_BASE_MODELS = {
     # Nano Banana 2.1, with the existing Gemini 3.1 alias retained.
     "gemini-3.1-flash-image": "gemini-3.1-flash-image",
     "gemini-3.1-flash-lite-image": "gemini-3.1-flash-lite-image",
+    # NewAPI rc.47 Gemini Imagen (:predict) compatibility aliases
+    "imagen-3.0-generate-002": "gemini-3.1-flash-image",
+    "imagen-3.0-generate-001": "gemini-3.1-flash-image",
+    "imagen-3.0-fast-generate-001": "gemini-3.1-flash-lite-image",
+    "imagen-4.0-generate-001": "gemini-3.1-flash-image",
+    "imagen-4.0-fast-generate-001": "gemini-3.1-flash-lite-image",
 }
 
 # ──────────────────────────────────────────────
@@ -616,6 +622,19 @@ def _extract_generation_params(request) -> Tuple[Optional[str], Optional[str]]:
                 )
 
     # 3) OpenAI 风格 size/quality（顶层 extra）兼容
+    if request is not None and (aspect_ratio is None or image_size is None):
+        aspect_ratio, image_size = _apply_image_config(
+            request, aspect_ratio, image_size
+        )
+        for nested_attr in ("parameters", "metadata"):
+            nested_obj = _read_value(request, nested_attr)
+            if nested_obj is not None and (
+                aspect_ratio is None or image_size is None
+            ):
+                aspect_ratio, image_size = _apply_image_config(
+                    nested_obj, aspect_ratio, image_size
+                )
+
     if (aspect_ratio is None or image_size is None) and hasattr(
         request, "__pydantic_extra__"
     ):
@@ -636,6 +655,137 @@ def _extract_generation_params(request) -> Tuple[Optional[str], Optional[str]]:
             )
 
     return aspect_ratio, image_size
+
+
+NEWAPI_VIDEO_FAMILY_MAP = {
+    "veo-3.1-generate-preview": "veo-3.1-quality",
+    "veo-3.0-generate-001": "veo-3.1-quality",
+    "veo-3.1-quality": "veo-3.1-quality",
+    "sora-2-pro": "veo-3.1-quality",
+    "veo-3.1-fast-generate-preview": "veo-3.1-fast",
+    "veo-3.0-fast-generate-001": "veo-3.1-fast",
+    "veo-3.1-fast": "veo-3.1-fast",
+    "veo-3.1-lite": "veo-3.1-lite",
+    "omni-1.2-flash": "omni-1.2-flash",
+    "sora-2": "omni-1.2-flash",
+    "omni-1.1-flash": "omni-1.1-flash",
+}
+
+
+def _extract_video_duration_seconds(request: Any) -> Optional[int]:
+    if request is None:
+        return None
+
+    def _probe(obj: Any) -> Optional[int]:
+        if obj is None:
+            return None
+        for key in ("duration", "seconds", "durationSeconds", "duration_seconds"):
+            val = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+            if val is None and hasattr(obj, "__pydantic_extra__"):
+                val = (obj.__pydantic_extra__ or {}).get(key)
+            if val is not None:
+                try:
+                    parsed = int(float(str(val).strip().rstrip("sS")))
+                    if parsed > 0:
+                        return parsed
+                except Exception:
+                    pass
+        return None
+
+    direct = _probe(request)
+    if direct is not None:
+        return direct
+    for nested_key in ("parameters", "metadata", "generationConfig"):
+        nested = (
+            request.get(nested_key)
+            if isinstance(request, dict)
+            else getattr(request, nested_key, None)
+        )
+        if nested is None and hasattr(request, "__pydantic_extra__"):
+            nested = (request.__pydantic_extra__ or {}).get(nested_key)
+        found = _probe(nested)
+        if found is not None:
+            return found
+    return None
+
+
+def _resolve_newapi_video_family_model(
+    model: str,
+    request: Any,
+    model_config: Optional[Dict[str, Any]],
+    images: Any,
+) -> Optional[str]:
+    family = NEWAPI_VIDEO_FAMILY_MAP.get(model)
+    if not family:
+        return None
+
+    aspect_ratio, image_size = (
+        _extract_generation_params(request) if request else (None, None)
+    )
+    if not aspect_ratio:
+        aspect_ratio = _infer_aspect_ratio_from_images(images, video_mode=True)
+    if aspect_ratio not in ("landscape", "portrait"):
+        aspect_ratio = "portrait" if aspect_ratio == "three-four" else "landscape"
+
+    duration = _extract_video_duration_seconds(request)
+    image_count = len(images) if isinstance(images, (list, tuple)) else 0
+
+    if family == "omni-1.2-flash":
+        sec = duration if duration is not None else 8
+        max_sec = 10 if aspect_ratio == "landscape" else 15
+        sec = max(3, min(max_sec, sec))
+        candidate = f"omni-1.2-flash-{sec}s-{aspect_ratio}"
+        if not model_config or candidate in model_config:
+            return candidate
+        return "omni-1.2-flash"
+
+    if family == "omni-1.1-flash":
+        sec = duration if duration in (4, 6, 8, 10) else 8
+        candidate = f"omni-1.1-flash-{sec}s-{aspect_ratio}"
+        if not model_config or candidate in model_config:
+            return candidate
+        return "omni-1.1-flash"
+
+    # Veo 3.1 families: handle 1080p / 4k upsample variants when requested
+    if image_size in ("1080p", "4k") and family in ("veo-3.1-quality", "veo-3.1-fast"):
+        sec_part = f"_{duration}s" if duration in (4, 6) else ""
+        orient_part = "_portrait" if aspect_ratio == "portrait" else "_landscape"
+        if image_count > 0:
+            if family == "veo-3.1-fast":
+                candidate = (
+                    f"veo_3_1_i2v_s_fast_portrait_ultra_fl_{image_size}"
+                    if aspect_ratio == "portrait"
+                    else f"veo_3_1_i2v_s_fast_ultra_fl_{image_size}"
+                )
+            else:
+                candidate = f"veo_3_1_i2v_s{orient_part}{sec_part}_{image_size}"
+        else:
+            if family == "veo-3.1-fast":
+                candidate = (
+                    f"veo_3_1_t2v_fast_portrait_{image_size}"
+                    if aspect_ratio == "portrait"
+                    else f"veo_3_1_t2v_fast_{image_size}"
+                )
+            else:
+                candidate = f"veo_3_1_t2v{orient_part}{sec_part}_{image_size}"
+        if not model_config or candidate in model_config:
+            return candidate
+
+    if image_count >= 1:
+        if image_count >= 3 and family in ("veo-3.1-fast", "veo-3.1-lite"):
+            candidate = f"{family}-r2v-8s-{aspect_ratio}"
+            if not model_config or candidate in model_config:
+                return candidate
+        i2v_sec = duration if duration in (4, 6) else 6
+        candidate = f"{family}-i2v-{i2v_sec}s-{aspect_ratio}"
+        if not model_config or candidate in model_config:
+            return candidate
+
+    sec = duration if duration in (4, 6, 8) else 8
+    candidate = f"{family}-{sec}s-{aspect_ratio}"
+    if not model_config or candidate in model_config:
+        return candidate
+    return family
 
 
 def resolve_model_name(
@@ -704,6 +854,20 @@ def resolve_model_name(
             f"(aspectRatio={aspect_ratio}, imageSize={image_size or 'default'})"
         )
         return resolved
+
+    # ────── NewAPI / Veo / Omni / Sora 视频模型家族动态解析 ──────
+    if model in NEWAPI_VIDEO_FAMILY_MAP:
+        resolved_family = _resolve_newapi_video_family_model(
+            model, request, model_config, images
+        )
+        if resolved_family and (
+            not model_config or resolved_family in model_config
+        ):
+            if resolved_family != model:
+                debug_logger.log_info(
+                    f"[MODEL_RESOLVER] NewAPI视频模型解析: {model} → {resolved_family}"
+                )
+            return resolved_family
 
     # ────── 视频模型解析 ──────
     if model in VIDEO_BASE_MODELS:
