@@ -2,7 +2,10 @@ version: '3.8'
 
 services:
   flow2api:
-    image: ghcr.io/thesmallhancat/flow2api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: momo-flow2api:latest
     container_name: flow2api
     ports:
       - "38000:8000"
