@@ -2818,7 +2818,6 @@ class GenerationHandler:
                         project_id=project_id,
                         token_id=token.id,
                         google_cookies=getattr(token, "google_cookies", None),
-                        resolution=resolution,
                     )
                     debug_logger.log_info(f"[I2V] 仅上传首帧: {start_media_id}")
 
@@ -2920,6 +2919,7 @@ class GenerationHandler:
                         token_id=token.id,
                         token_video_concurrency=token.video_concurrency,
                         google_cookies=getattr(token, "google_cookies", None),
+                        resolution=resolution,
                     )
                 else:
                     # 只有首帧 - 需要去掉 model_key 中的 _fl
@@ -2945,6 +2945,7 @@ class GenerationHandler:
                         token_id=token.id,
                         token_video_concurrency=token.video_concurrency,
                         google_cookies=getattr(token, "google_cookies", None),
+                        resolution=resolution,
                     )
 
             # R2V: 多图生成
