@@ -291,6 +291,7 @@ class NewApiRoutesCompatibilityTests(unittest.IsolatedAsyncioTestCase):
 
         self.handler = MagicMock()
         self.handler.db = self.db
+        self.generation_calls = []
         self.handler.token_manager = MagicMock()
         self.handler.token_manager.get_all_tokens = AsyncMock(
             return_value=[self.token]
@@ -302,6 +303,7 @@ class NewApiRoutesCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         async def fake_handle_generation(
             model, prompt, images=None, stream=False, **kwargs
         ):
+            self.generation_calls.append({"model": model, "prompt": prompt, "images": images, **kwargs})
             if "veo" in model or "omni" in model:
                 yield json.dumps(
                     {
@@ -579,6 +581,29 @@ class NewApiRoutesCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(artifact_resp.status_code, 200)
             self.assertEqual(artifact_resp.content, fake_mp4)
+
+    async def test_video_multipart_preserves_start_end_frames(self):
+        png_bytes = _make_png_bytes(64, 64)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app), base_url="http://localhost"
+        ) as client:
+            response = await client.post(
+                "/v1/videos",
+                data={"model": "omni-1.2-flash", "prompt": "transition", "resolution": "360p"},
+                files={
+                    "first_frame_image": ("first.png", png_bytes, "image/png"),
+                    "last_frame_image": ("last.png", png_bytes, "image/png"),
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            await asyncio.sleep(0.2)
+
+        self.assertEqual(len(self.generation_calls), 1)
+        call = self.generation_calls[0]
+        self.assertEqual(call["resolution"], "360p")
+        self.assertEqual(call["first_frame"], png_bytes)
+        self.assertEqual(call["last_frame"], png_bytes)
+        self.assertEqual(len(call["images"]), 2)
 
 if __name__ == "__main__":
     unittest.main()

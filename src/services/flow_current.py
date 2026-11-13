@@ -667,6 +667,7 @@ class CurrentFlowClientMixin:
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
         google_cookies: Optional[str] = None,
+        resolution: Optional[str] = None,
     ) -> dict:
         return await self._current_generate_video(
             project_id=project_id,
@@ -677,6 +678,7 @@ class CurrentFlowClientMixin:
             token_id=token_id,
             token_video_concurrency=token_video_concurrency,
             google_cookies=google_cookies,
+            resolution=resolution,
         )
 
     async def generate_video_reference_images(
@@ -691,6 +693,7 @@ class CurrentFlowClientMixin:
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
         google_cookies: Optional[str] = None,
+        resolution: Optional[str] = None,
     ) -> dict:
         media_ids = [
             str(item.get("mediaId") or item.get("name") or "").strip()
@@ -707,6 +710,7 @@ class CurrentFlowClientMixin:
             token_id=token_id,
             token_video_concurrency=token_video_concurrency,
             google_cookies=google_cookies,
+            resolution=resolution,
         )
 
     async def generate_video_start_end(
@@ -723,6 +727,7 @@ class CurrentFlowClientMixin:
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
         google_cookies: Optional[str] = None,
+        resolution: Optional[str] = None,
     ) -> dict:
         return await self._current_generate_video(
             project_id=project_id,
@@ -735,6 +740,7 @@ class CurrentFlowClientMixin:
             token_id=token_id,
             token_video_concurrency=token_video_concurrency,
             google_cookies=google_cookies,
+            resolution=resolution,
         )
 
     async def generate_video_start_image(
@@ -750,6 +756,7 @@ class CurrentFlowClientMixin:
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
         google_cookies: Optional[str] = None,
+        resolution: Optional[str] = None,
     ) -> dict:
         return await self._current_generate_video(
             project_id=project_id,
@@ -761,6 +768,7 @@ class CurrentFlowClientMixin:
             token_id=token_id,
             token_video_concurrency=token_video_concurrency,
             google_cookies=google_cookies,
+            resolution=resolution,
         )
 
     async def generate_video_extend(

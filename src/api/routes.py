@@ -628,6 +628,9 @@ async def _collect_non_stream_result(
     model: str,
     prompt: str,
     images: List[bytes],
+    first_frame: Optional[bytes] = None,
+    last_frame: Optional[bytes] = None,
+    resolution: Optional[str] = None,
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
 ) -> str:
@@ -637,6 +640,9 @@ async def _collect_non_stream_result(
         model=model,
         prompt=prompt,
         images=images if images else None,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        resolution=resolution,
         stream=False,
         base_url_override=base_url_override,
         video_media_id=video_media_id,
@@ -1083,6 +1089,8 @@ class VideoGenerationTaskRequest(BaseModel):
     image_url: Optional[Any] = None
     first_frame_image: Optional[str] = None
     last_frame_image: Optional[str] = None
+    reference_video: Optional[Any] = None
+    resolution: Optional[str] = None
     reference_images: Optional[List[Any]] = None
     video_media_id: Optional[str] = None
 
@@ -1325,6 +1333,9 @@ async def _start_async_video_task(
     resolved_model: str,
     prompt: str,
     images: List[bytes],
+    first_frame: Optional[bytes] = None,
+    last_frame: Optional[bytes] = None,
+    resolution: Optional[str] = None,
     request_base_url: Optional[str],
     video_media_id: Optional[str] = None,
 ) -> Task:
@@ -1363,6 +1374,9 @@ async def _start_async_video_task(
                 resolved_model,
                 prompt,
                 images,
+                first_frame=first_frame,
+                last_frame=last_frame,
+                resolution=resolution,
                 base_url_override=request_base_url,
                 video_media_id=video_media_id,
             )
@@ -1434,6 +1448,8 @@ async def create_video_generation_task(
         prompt = _sanitize_media_prompt(str(form.get("prompt") or ""))
         requested_model = str(form.get("model") or "omni-1.2-flash").strip()
         images: List[bytes] = []
+        first_frame = None
+        last_frame = None
         for key in ("input_reference", "image", "image[]", "images", "images[]"):
             for item in form.getlist(key):
                 if hasattr(item, "read"):
@@ -1442,6 +1458,19 @@ async def create_video_generation_task(
                         images.append(data)
                 elif isinstance(item, str) and item.strip():
                     images.extend(await _extract_images_from_flexible_inputs(item))
+        for key in ("first_frame_image", "last_frame_image"):
+            item = form.get(key)
+            if hasattr(item, "read"):
+                data = await item.read()
+            elif isinstance(item, str) and item.strip():
+                data = await _load_image_bytes_from_uri(item)
+            else:
+                data = None
+            if data:
+                if key == "first_frame_image":
+                    first_frame = data
+                else:
+                    last_frame = data
         metadata_raw = form.get("metadata")
         metadata_obj = None
         if isinstance(metadata_raw, str) and metadata_raw.strip():
@@ -1458,6 +1487,7 @@ async def create_video_generation_task(
             or None,
             image_size=str(form.get("image_size") or form.get("imageSize") or form.get("resolution") or "")
             or None,
+            resolution=str(form.get("resolution") or "") or None,
             video_media_id=str(form.get("video_media_id") or "") or None,
             seconds=form.get("seconds") or form.get("duration"),
             metadata=metadata_obj,
@@ -1467,15 +1497,24 @@ async def create_video_generation_task(
         req = VideoGenerationTaskRequest.model_validate(body)
         prompt = _sanitize_media_prompt(req.prompt)
         requested_model = (req.model or "omni-1.2-flash").strip()
+        first_frame_values = await _extract_images_from_flexible_inputs(req.first_frame_image)
+        last_frame_values = await _extract_images_from_flexible_inputs(req.last_frame_image)
+        first_frame = first_frame_values[0] if first_frame_values else None
+        last_frame = last_frame_values[0] if last_frame_values else None
         images = await _extract_images_from_flexible_inputs(
-            req.first_frame_image,
-            req.last_frame_image,
             getattr(req, "input_reference", None),
             req.image,
             req.images,
             req.image_url,
             req.reference_images,
         )
+
+    if first_frame or last_frame:
+        if not first_frame:
+            raise HTTPException(status_code=400, detail="last_frame_image requires first_frame_image")
+        if images:
+            raise HTTPException(status_code=400, detail="frame inputs cannot be mixed with reference images")
+        images = [first_frame] + ([last_frame] if last_frame else [])
 
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
@@ -1491,6 +1530,9 @@ async def create_video_generation_task(
         resolved_model=resolved_model,
         prompt=prompt,
         images=images,
+        first_frame=first_frame,
+        last_frame=last_frame,
+        resolution=req.resolution or req.image_size,
         request_base_url=_get_request_base_url(raw_request),
         video_media_id=req.video_media_id,
     )
