@@ -628,11 +628,11 @@ async def _collect_non_stream_result(
     model: str,
     prompt: str,
     images: List[bytes],
+    base_url_override: Optional[str] = None,
+    video_media_id: Optional[str] = None,
     first_frame: Optional[bytes] = None,
     last_frame: Optional[bytes] = None,
     resolution: Optional[str] = None,
-    base_url_override: Optional[str] = None,
-    video_media_id: Optional[str] = None,
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -1445,6 +1445,12 @@ async def create_video_generation_task(
     content_type = (raw_request.headers.get("content-type") or "").lower()
     if "multipart/form-data" in content_type:
         form = await raw_request.form()
+        for field in ("reference_video", "reference_videos", "video_url", "mask", "matte"):
+            if field in form:
+                raise HTTPException(400, "Video editing upload/mask protocol is not enabled yet")
+        for field in ("first_frame_image", "last_frame_image"):
+            if len(form.getlist(field)) > 1:
+                raise HTTPException(400, field + " must be provided once")
         prompt = _sanitize_media_prompt(str(form.get("prompt") or ""))
         requested_model = str(form.get("model") or "omni-1.2-flash").strip()
         images: List[bytes] = []
@@ -1495,6 +1501,8 @@ async def create_video_generation_task(
     else:
         body = await raw_request.json()
         req = VideoGenerationTaskRequest.model_validate(body)
+        if any(body.get(field) is not None for field in ("reference_video", "reference_videos", "video_url", "mask", "matte")):
+            raise HTTPException(400, "Video editing upload/mask protocol is not enabled yet")
         prompt = _sanitize_media_prompt(req.prompt)
         requested_model = (req.model or "omni-1.2-flash").strip()
         first_frame_values = await _extract_images_from_flexible_inputs(req.first_frame_image)
@@ -1526,13 +1534,18 @@ async def create_video_generation_task(
             status_code=400, detail=f"Unsupported video model: {requested_model}"
         )
 
+    if req.video_media_id and model_cfg.get("video_type") != "extend":
+        raise HTTPException(400, "video_media_id requires an explicit extend model")
+    resolution = req.resolution or req.image_size
+    if resolution and resolution.lower() != "720p":
+        raise HTTPException(400, "Generation currently supports 720p; 360p editing is not enabled yet")
     task = await _start_async_video_task(
         resolved_model=resolved_model,
         prompt=prompt,
         images=images,
         first_frame=first_frame,
         last_frame=last_frame,
-        resolution=req.resolution or req.image_size,
+        resolution=resolution,
         request_base_url=_get_request_base_url(raw_request),
         video_media_id=req.video_media_id,
     )

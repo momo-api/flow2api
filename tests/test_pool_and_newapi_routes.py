@@ -589,7 +589,7 @@ class NewApiRoutesCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         ) as client:
             response = await client.post(
                 "/v1/videos",
-                data={"model": "omni-1.2-flash", "prompt": "transition", "resolution": "360p"},
+                data={"model": "omni-1.2-flash", "prompt": "transition", "resolution": "720p"},
                 files={
                     "first_frame_image": ("first.png", png_bytes, "image/png"),
                     "last_frame_image": ("last.png", png_bytes, "image/png"),
@@ -600,7 +600,7 @@ class NewApiRoutesCompatibilityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(self.generation_calls), 1)
         call = self.generation_calls[0]
-        self.assertEqual(call["resolution"], "360p")
+        self.assertEqual(call["resolution"], "720p")
         self.assertEqual(call["first_frame"], png_bytes)
         self.assertEqual(call["last_frame"], png_bytes)
         self.assertEqual(len(call["images"]), 2)

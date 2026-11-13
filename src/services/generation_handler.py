@@ -1636,12 +1636,12 @@ class GenerationHandler:
         model: str,
         prompt: str,
         images: Optional[List[bytes]] = None,
-        first_frame: Optional[bytes] = None,
-        last_frame: Optional[bytes] = None,
-        resolution: Optional[str] = None,
         stream: bool = False,
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
+        first_frame: Optional[bytes] = None,
+        last_frame: Optional[bytes] = None,
+        resolution: Optional[str] = None,
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -2671,15 +2671,15 @@ class GenerationHandler:
         prompt: str,
         images: Optional[List[bytes]],
         stream: bool,
-        first_frame: Optional[bytes] = None,
-        last_frame: Optional[bytes] = None,
-        resolution: Optional[str] = None,
         perf_trace: Optional[Dict[str, Any]] = None,
         generation_result: Optional[Dict[str, Any]] = None,
         response_state: Optional[Dict[str, Any]] = None,
         request_log_state: Optional[Dict[str, Any]] = None,
         pending_token_state: Optional[Dict[str, bool]] = None,
         video_media_id: Optional[str] = None,
+        first_frame: Optional[bytes] = None,
+        last_frame: Optional[bytes] = None,
+        resolution: Optional[str] = None,
     ) -> AsyncGenerator:
         """处理视频生成 (异步轮询)"""
 
@@ -2751,9 +2751,11 @@ class GenerationHandler:
 
             if video_type == "omni" and (first_frame is not None or last_frame is not None):
                 video_type = "i2v"
+                # Only the 3s Omni frame key is evidenced by the supplied capture.
+                if model_config.get("reference_duration") != 3:
+                    raise ValueError("Omni frame inputs currently require seconds=3")
                 model_config["model_key"] = "macaron_cookie_i2v_fl_3s"
-                model_config["min_images"] = 1
-                model_config["max_images"] = 2
+                min_images, max_images = 1, 2
 
             # ========== 验证和处理图片 ==========
 
