@@ -1639,6 +1639,9 @@ class GenerationHandler:
         stream: bool = False,
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
+        first_frame: Optional[bytes] = None,
+        last_frame: Optional[bytes] = None,
+        resolution: Optional[str] = None,
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -1918,6 +1921,9 @@ class GenerationHandler:
                         request_log_state=request_log_state,
                         pending_token_state=pending_token_state,
                         video_media_id=video_media_id,
+                        first_frame=first_frame,
+                        last_frame=last_frame,
+                        resolution=resolution,
                     ):
                         yield chunk
                 perf_trace["generation_pipeline_ms"] = int(
@@ -2671,6 +2677,9 @@ class GenerationHandler:
         request_log_state: Optional[Dict[str, Any]] = None,
         pending_token_state: Optional[Dict[str, bool]] = None,
         video_media_id: Optional[str] = None,
+        first_frame: Optional[bytes] = None,
+        last_frame: Optional[bytes] = None,
+        resolution: Optional[str] = None,
     ) -> AsyncGenerator:
         """处理视频生成 (异步轮询)"""
 
@@ -2736,7 +2745,17 @@ class GenerationHandler:
             model_config["model_key"] = model_key
 
             # 图片数量
+            if first_frame is not None or last_frame is not None:
+                images = [item for item in (first_frame, last_frame) if item is not None]
             image_count = len(images) if images else 0
+
+            if video_type == "omni" and (first_frame is not None or last_frame is not None):
+                video_type = "i2v"
+                # Only the 3s Omni frame key is evidenced by the supplied capture.
+                if model_config.get("reference_duration") != 3:
+                    raise ValueError("Omni frame inputs currently require seconds=3")
+                model_config["model_key"] = "macaron_cookie_i2v_fl_3s"
+                min_images, max_images = 1, 2
 
             # ========== 验证和处理图片 ==========
 
@@ -2902,13 +2921,16 @@ class GenerationHandler:
                         token_id=token.id,
                         token_video_concurrency=token.video_concurrency,
                         google_cookies=getattr(token, "google_cookies", None),
+                        resolution=resolution,
                     )
                 else:
                     # 只有首帧 - 需要去掉 model_key 中的 _fl
                     # 情况1: _fl_ 在中间 (如 veo_3_1_i2v_s_fast_fl_ultra_relaxed -> veo_3_1_i2v_s_fast_ultra_relaxed)
                     # 情况2: _fl 在结尾 (如 veo_3_1_i2v_s_fast_ultra_fl -> veo_3_1_i2v_s_fast_ultra)
-                    actual_model_key = model_config["model_key"].replace("_fl_", "_")
-                    if actual_model_key.endswith("_fl"):
+                    actual_model_key = model_config["model_key"]
+                    if not actual_model_key.startswith("macaron_cookie_"):
+                        actual_model_key = actual_model_key.replace("_fl_", "_")
+                    if actual_model_key.endswith("_fl") and not actual_model_key.startswith("macaron_cookie_"):
                         actual_model_key = actual_model_key[:-3]
                     debug_logger.log_info(
                         f"[I2V] 单帧模式，model_key: {model_config['model_key']} -> {actual_model_key}"
@@ -2925,6 +2947,7 @@ class GenerationHandler:
                         token_id=token.id,
                         token_video_concurrency=token.video_concurrency,
                         google_cookies=getattr(token, "google_cookies", None),
+                        resolution=resolution,
                     )
 
             # R2V: 多图生成
@@ -2940,6 +2963,7 @@ class GenerationHandler:
                     token_id=token.id,
                     token_video_concurrency=token.video_concurrency,
                     google_cookies=getattr(token, "google_cookies", None),
+                    resolution=resolution,
                 )
 
             # Omni: 有图走 Reference Images 直连链路，无图走纯文本链路
@@ -2957,6 +2981,7 @@ class GenerationHandler:
                     token_id=token.id,
                     token_video_concurrency=token.video_concurrency,
                     google_cookies=getattr(token, "google_cookies", None),
+                    resolution=resolution,
                 )
 
             # Extend: 视频续写
@@ -2999,6 +3024,7 @@ class GenerationHandler:
                     token_id=token.id,
                     token_video_concurrency=token.video_concurrency,
                     google_cookies=getattr(token, "google_cookies", None),
+                    resolution=resolution,
                 )
             if video_trace is not None:
                 video_trace["submit_generation_ms"] = int(
