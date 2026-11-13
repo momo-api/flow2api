@@ -1523,6 +1523,9 @@ async def create_video_generation_task(
         if images:
             raise HTTPException(status_code=400, detail="frame inputs cannot be mixed with reference images")
         images = [first_frame] + ([last_frame] if last_frame else [])
+        raw_seconds = (req.model_extra or {}).get("seconds", (req.model_extra or {}).get("duration"))
+        if raw_seconds is None or float(raw_seconds) != 3:
+            raise HTTPException(400, "Omni frame inputs currently require seconds=3")
 
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")

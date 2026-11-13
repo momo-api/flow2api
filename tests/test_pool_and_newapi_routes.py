@@ -589,7 +589,7 @@ class NewApiRoutesCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         ) as client:
             response = await client.post(
                 "/v1/videos",
-                data={"model": "omni-1.2-flash", "prompt": "transition", "resolution": "720p"},
+                data={"model": "omni-1.2-flash", "prompt": "transition", "resolution": "720p", "seconds": "3"},
                 files={
                     "first_frame_image": ("first.png", png_bytes, "image/png"),
                     "last_frame_image": ("last.png", png_bytes, "image/png"),
