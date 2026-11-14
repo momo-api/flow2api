@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from src.services.flow_client import FlowClient
 
@@ -10,6 +10,46 @@ MEDIA_ID = "11234567-89ab-cdef-0123-456789abcdef"
 
 
 class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_video_upload_uses_resumable_flow_protocol(self):
+        client = FlowClient(proxy_manager=None)
+        client._resolve_flow_frontend_cookie_storage = AsyncMock(return_value="SID=session-cookie")
+        client._get_effective_request_user_agent = lambda: "Mozilla/5.0 Chrome/157.0.0.0"
+        client._resolve_runtime_impersonate = lambda: "chrome"
+        client._get_control_plane_timeout = lambda: 30
+        client.get_request_fingerprint = lambda: {}
+        client._update_flow_cookie_jar = lambda *_: None
+        client._remember_flow_cookies = lambda *_: None
+
+        class Response:
+            def __init__(self, status, headers=None, payload=None):
+                self.status_code = status
+                self.headers = headers or {}
+                self._payload = payload
+            def json(self):
+                return self._payload
+
+        class Session:
+            def __init__(self):
+                self.curl_options = {}
+                self.calls = []
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): return False
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                if len(self.calls) == 1:
+                    return Response(200, {"x-goog-upload-url": "https://flow.google.com/upload/v1/flow/upload/video/" + PROJECT_ID + "?upload_id=test"})
+                return Response(200, payload=[MEDIA_ID, PROJECT_ID])
+
+        session = Session()
+        with patch("src.services.flow_current.AsyncSession", return_value=session):
+            media_id = await client.upload_video(
+                b"video-bytes", PROJECT_ID, token_id=None, google_cookies="SID=session-cookie"
+            )
+        self.assertEqual(media_id, MEDIA_ID)
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(session.calls[0][1]["headers"]["X-Goog-Upload-Command"], "start")
+        self.assertEqual(session.calls[1][1]["headers"]["X-Goog-Upload-Command"], "upload, finalize")
+
     async def test_upload_uses_current_frontend_rpc(self):
         client = FlowClient(proxy_manager=None)
         client._get_recaptcha_token = AsyncMock(return_value=("captcha-token", None))
@@ -75,6 +115,26 @@ class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
                 project_id=None,
                 google_cookies="SID=session-cookie",
             )
+
+    async def test_video_edit_uses_current_jips6_payload(self):
+        client = FlowClient(proxy_manager=None)
+        client._current_generate_video = AsyncMock(return_value={"ok": True})
+        result = await client.generate_video_edit(
+            at="frontend-cookie",
+            project_id=PROJECT_ID,
+            prompt="make it dance",
+            source_media_id=MEDIA_ID,
+            aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
+            source_start_frame=0,
+            source_end_frame=184,
+            google_cookies="SID=session-cookie",
+        )
+        self.assertEqual(result, {"ok": True})
+        kwargs = client._current_generate_video.await_args.kwargs
+        self.assertEqual(kwargs["mode"], "edit")
+        self.assertEqual(kwargs["model_key"], "macaron_cookie_edit_360p")
+        self.assertEqual(kwargs["source_start_frame"], 0)
+        self.assertEqual(kwargs["source_end_frame"], 184)
 
 
 if __name__ == "__main__":
