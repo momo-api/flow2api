@@ -353,6 +353,9 @@ class NewApiRoutesCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.app.dependency_overrides[verify_api_key_flexible] = lambda: "test-key"
 
     async def asyncTearDown(self):
+        pending = list(routes._background_video_tasks.values())
+        if pending:
+            await asyncio.gather(*pending)
         self.tmpdir.cleanup()
 
     async def test_openai_images_generations_and_edits_endpoints(self):
@@ -604,6 +607,32 @@ class NewApiRoutesCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["first_frame"], png_bytes)
         self.assertEqual(call["last_frame"], png_bytes)
         self.assertEqual(len(call["images"]), 2)
+
+    async def test_video_multipart_accepts_material_edit_fields(self):
+        video_bytes = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app), base_url="http://localhost"
+        ) as client:
+            response = await client.post(
+                "/v1/videos",
+                data={
+                    "model": "omni-1.2-flash",
+                    "prompt": "make the subject dance",
+                    "resolution": "360p",
+                    "source_start_frame": "0",
+                    "source_end_frame": "184",
+                },
+                files={"reference_video": ("source.mp4", video_bytes, "video/mp4")},
+            )
+            self.assertEqual(response.status_code, 200)
+            await asyncio.sleep(0.05)
+
+        self.assertEqual(len(self.generation_calls), 1)
+        call = self.generation_calls[0]
+        self.assertEqual(call["resolution"], "360p")
+        self.assertEqual(call["source_video"], video_bytes)
+        self.assertEqual(call["source_start_frame"], 0)
+        self.assertEqual(call["source_end_frame"], 184)
 
 if __name__ == "__main__":
     unittest.main()

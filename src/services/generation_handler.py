@@ -1642,6 +1642,9 @@ class GenerationHandler:
         first_frame: Optional[bytes] = None,
         last_frame: Optional[bytes] = None,
         resolution: Optional[str] = None,
+        source_video: Optional[bytes] = None,
+        source_start_frame: int = 0,
+        source_end_frame: Optional[int] = None,
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -1924,6 +1927,9 @@ class GenerationHandler:
                         first_frame=first_frame,
                         last_frame=last_frame,
                         resolution=resolution,
+                        source_video=source_video,
+                        source_start_frame=source_start_frame,
+                        source_end_frame=source_end_frame,
                     ):
                         yield chunk
                 perf_trace["generation_pipeline_ms"] = int(
@@ -2680,6 +2686,9 @@ class GenerationHandler:
         first_frame: Optional[bytes] = None,
         last_frame: Optional[bytes] = None,
         resolution: Optional[str] = None,
+        source_video: Optional[bytes] = None,
+        source_start_frame: int = 0,
+        source_end_frame: Optional[int] = None,
     ) -> AsyncGenerator:
         """处理视频生成 (异步轮询)"""
 
@@ -2743,6 +2752,15 @@ class GenerationHandler:
             # 更新 model_config 中的 model_key
             model_config = dict(model_config)  # 创建副本避免修改原配置
             model_config["model_key"] = model_key
+
+            if source_video is not None:
+                if (video_type != "omni" or resolution != "360p" or images
+                        or first_frame is not None or last_frame is not None):
+                    raise ValueError("Video editing cannot be mixed with frame/image generation")
+                video_type = "material"
+                video_trace = perf_trace.setdefault("video_generation", {}) if isinstance(perf_trace, dict) else None
+                if video_trace is not None:
+                    video_trace["material_edit"] = True
 
             # 图片数量
             if first_frame is not None or last_frame is not None:
@@ -2905,7 +2923,22 @@ class GenerationHandler:
             submit_started_at = time.time()
 
             # I2V: 首尾帧生成
-            if video_type == "i2v" and start_media_id:
+            if video_type == "material":
+                source_media_id = await self.flow_client.upload_video(
+                    source_video, project_id, token_id=token.id,
+                    google_cookies=getattr(token, "google_cookies", None),
+                )
+                result = await self.flow_client.generate_video_edit(
+                    at=token.at, project_id=project_id, prompt=prompt,
+                    source_media_id=source_media_id,
+                    source_start_frame=source_start_frame,
+                    source_end_frame=source_end_frame,
+                    aspect_ratio=model_config["aspect_ratio"],
+                    user_paygate_tier=normalized_tier, token_id=token.id,
+                    token_video_concurrency=token.video_concurrency,
+                    google_cookies=getattr(token, "google_cookies", None),
+                )
+            elif video_type == "i2v" and start_media_id:
                 if end_media_id:
                     # 有首尾帧
                     result = await self.flow_client.generate_video_start_end(

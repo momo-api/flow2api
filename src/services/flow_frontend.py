@@ -347,6 +347,8 @@ class FlowFrontendMixin:
         video_media_id: Optional[str] = None,
         resolution: Optional[str] = None,
         output_spec: Optional[Any] = None,
+        source_start_frame: int = 0,
+        source_end_frame: Optional[int] = None,
     ) -> tuple[str, List[Any]]:
         prompt_value = self._frontend_prompt(prompt)
         prompt_message = [None, None, prompt_value]
@@ -355,7 +357,23 @@ class FlowFrontendMixin:
         resolution_value = self._frontend_video_resolution(resolution)
         normalized_mode = str(mode or "text").strip().lower()
 
-        if normalized_mode == "references":
+        if normalized_mode == "edit":
+            if (not self._is_uuid(start_media_id)
+                    or type(source_start_frame) is not int
+                    or type(source_end_frame) is not int
+                    or not 0 <= source_start_frame < source_end_frame):
+                raise ValueError("Video edit requires a source media ID and frame range")
+            if model_key != "macaron_cookie_edit_360p":
+                raise ValueError("Unverified video edit model key")
+            # HAR entries 66/81/103: source range, prompt, key, ratio, metadata,
+            # seven absent fields, then the recorded edit-mode enum [4].
+            rpc_id = "jIps6"
+            request = [
+                [None, start_media_id, source_start_frame, source_end_frame],
+                prompt_message, model_key, aspect_value, metadata,
+                None, None, None, None, None, None, None, [4],
+            ]
+        elif normalized_mode == "references":
             references = [
                 self._frontend_media_reference(media_id)
                 for media_id in (reference_media_ids or [])

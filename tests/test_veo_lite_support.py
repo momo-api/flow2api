@@ -38,6 +38,27 @@ class VeoLiteModelResolverTests(unittest.TestCase):
             MODEL_CONFIG["veo-3.1-fast-4s-landscape"]["model_key"],
             "veo_3_1_t2v_fast_4s_relaxed",
         )
+
+    def test_material_edit_uses_jips6_360p_source_range(self):
+        client = FlowClient(proxy_manager=None)
+        rpc_id, argument = client._build_frontend_video_generation_argument(
+            project_id="01234567-89ab-cdef-0123-456789abcdef",
+            prompt="make the subject dance",
+            model_key="macaron_cookie_edit_360p",
+            aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
+            recaptcha_token="captcha-token",
+            session_id="01234567-89ab-cdef-0123-456789abcdef",
+            mode="edit",
+            start_media_id="11234567-89ab-cdef-0123-456789abcdef",
+            source_start_frame=0,
+            source_end_frame=184,
+            resolution="360p",
+        )
+        self.assertEqual(rpc_id, "jIps6")
+        request = argument[0][0]
+        self.assertEqual(request[0], [None, "11234567-89ab-cdef-0123-456789abcdef", 0, 184])
+        self.assertEqual(request[2], "macaron_cookie_edit_360p")
+        self.assertEqual(request[-1], [4])
         self.assertEqual(
             MODEL_CONFIG["omni-1.1-flash-4s-landscape"]["model_key"],
             "abra_t2v_4s",

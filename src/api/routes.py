@@ -361,6 +361,28 @@ async def _load_image_bytes_from_uri(uri: str) -> bytes:
     raise HTTPException(status_code=400, detail=f"Unsupported image URI: {uri}")
 
 
+async def _load_video_bytes_from_uri(uri: Any) -> bytes:
+    maximum = 100 * 1024 * 1024
+    if hasattr(uri, "read"):
+        data = await uri.read(maximum + 1)
+    else:
+        value = str(uri or "").strip()
+        if not value.startswith("data:video/mp4;base64,"):
+            raise HTTPException(400, "Use an MP4 upload or data:video/mp4 URI")
+        encoded = value.split(",", 1)[1]
+        if len(encoded) > 4 * ((maximum + 2) // 3):
+            raise HTTPException(400, "Video exceeds 100 MiB")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid base64 video") from exc
+    if not data or len(data) > maximum:
+        raise HTTPException(400, "Video is empty or exceeds 100 MiB")
+    if len(data) < 12 or data[4:8] != b"ftyp":
+        raise HTTPException(400, "Material input must be an MP4 file")
+    return data
+
+
 def _coerce_gemini_contents(raw_contents: Optional[List[Any]]) -> List[GeminiContent]:
     contents: List[GeminiContent] = []
     for item in raw_contents or []:
@@ -633,6 +655,9 @@ async def _collect_non_stream_result(
     first_frame: Optional[bytes] = None,
     last_frame: Optional[bytes] = None,
     resolution: Optional[str] = None,
+    source_video: Optional[bytes] = None,
+    source_start_frame: int = 0,
+    source_end_frame: Optional[int] = None,
 ) -> str:
     handler = _ensure_generation_handler()
     result = None
@@ -646,6 +671,9 @@ async def _collect_non_stream_result(
         stream=False,
         base_url_override=base_url_override,
         video_media_id=video_media_id,
+        source_video=source_video,
+        source_start_frame=source_start_frame,
+        source_end_frame=source_end_frame,
     ):
         result = chunk
 
@@ -1093,6 +1121,8 @@ class VideoGenerationTaskRequest(BaseModel):
     resolution: Optional[str] = None
     reference_images: Optional[List[Any]] = None
     video_media_id: Optional[str] = None
+    source_start_frame: Optional[int] = 0
+    source_end_frame: Optional[int] = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -1338,6 +1368,9 @@ async def _start_async_video_task(
     resolution: Optional[str] = None,
     request_base_url: Optional[str],
     video_media_id: Optional[str] = None,
+    source_video: Optional[bytes] = None,
+    source_start_frame: int = 0,
+    source_end_frame: Optional[int] = None,
 ) -> Task:
     handler = _ensure_generation_handler()
     task_id = f"video-{uuid.uuid4().hex}"
@@ -1379,6 +1412,9 @@ async def _start_async_video_task(
                 resolution=resolution,
                 base_url_override=request_base_url,
                 video_media_id=video_media_id,
+                source_video=source_video,
+                source_start_frame=source_start_frame,
+                source_end_frame=source_end_frame,
             )
             payload = _enrich_payload_with_direct_url(_parse_handler_result(raw_result))
             if "error" in payload:
@@ -1443,11 +1479,16 @@ async def create_video_generation_task(
 ):
     """Submit an asynchronous video task (supports JSON and multipart/form-data for NewAPI sora/openai_video)."""
     content_type = (raw_request.headers.get("content-type") or "").lower()
+    source_video = None
     if "multipart/form-data" in content_type:
         form = await raw_request.form()
-        for field in ("reference_video", "reference_videos", "video_url", "mask", "matte"):
+        for field in ("reference_videos", "video_url", "mask", "matte"):
             if field in form:
-                raise HTTPException(400, "Video editing upload/mask protocol is not enabled yet")
+                raise HTTPException(400, f"{field} has no implemented wire mapping")
+        if len(form.getlist("reference_video")) > 1:
+            raise HTTPException(400, "reference_video must be provided once")
+        if form.get("reference_video") is not None:
+            source_video = await _load_video_bytes_from_uri(form.get("reference_video"))
         for field in ("first_frame_image", "last_frame_image"):
             if len(form.getlist(field)) > 1:
                 raise HTTPException(400, field + " must be provided once")
@@ -1497,12 +1538,17 @@ async def create_video_generation_task(
             video_media_id=str(form.get("video_media_id") or "") or None,
             seconds=form.get("seconds") or form.get("duration"),
             metadata=metadata_obj,
+            source_start_frame=form.get("source_start_frame") or 0,
+            source_end_frame=form.get("source_end_frame"),
         )
     else:
         body = await raw_request.json()
         req = VideoGenerationTaskRequest.model_validate(body)
-        if any(body.get(field) is not None for field in ("reference_video", "reference_videos", "video_url", "mask", "matte")):
-            raise HTTPException(400, "Video editing upload/mask protocol is not enabled yet")
+        for field in ("reference_videos", "video_url", "mask", "matte"):
+            if body.get(field) is not None:
+                raise HTTPException(400, f"{field} has no implemented wire mapping")
+        if body.get("reference_video") is not None:
+            source_video = await _load_video_bytes_from_uri(body["reference_video"])
         prompt = _sanitize_media_prompt(req.prompt)
         requested_model = (req.model or "omni-1.2-flash").strip()
         first_frame_values = await _extract_images_from_flexible_inputs(req.first_frame_image)
@@ -1540,8 +1586,15 @@ async def create_video_generation_task(
     if req.video_media_id and model_cfg.get("video_type") != "extend":
         raise HTTPException(400, "video_media_id requires an explicit extend model")
     resolution = req.resolution or req.image_size
-    if resolution and resolution.lower() != "720p":
-        raise HTTPException(400, "Generation currently supports 720p; 360p editing is not enabled yet")
+    if source_video:
+        if not requested_model.startswith("omni-1.2-flash") or images or first_frame or last_frame:
+            raise HTTPException(400, "Video editing cannot be mixed with frame/image generation")
+        if (resolution or "").lower() != "360p":
+            raise HTTPException(400, "Captured video-edit mapping requires resolution=360p")
+        if req.source_end_frame is None or not 0 <= (req.source_start_frame or 0) < req.source_end_frame:
+            raise HTTPException(400, "An explicit increasing source frame range is required")
+    elif resolution and resolution.lower() != "720p":
+        raise HTTPException(400, "Use a source video for the captured 360p edit protocol")
     task = await _start_async_video_task(
         resolved_model=resolved_model,
         prompt=prompt,
@@ -1551,6 +1604,9 @@ async def create_video_generation_task(
         resolution=resolution,
         request_base_url=_get_request_base_url(raw_request),
         video_media_id=req.video_media_id,
+        source_video=source_video,
+        source_start_frame=req.source_start_frame or 0,
+        source_end_frame=req.source_end_frame,
     )
     return _format_video_task_payload(task)
 
