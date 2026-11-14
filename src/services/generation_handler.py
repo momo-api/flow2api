@@ -2928,6 +2928,10 @@ class GenerationHandler:
                     source_video, project_id, token_id=token.id,
                     google_cookies=getattr(token, "google_cookies", None),
                 )
+                await self.flow_client.wait_for_video_media_ready(
+                    source_media_id, project_id, token_id=token.id,
+                    google_cookies=getattr(token, "google_cookies", None),
+                )
                 result = await self.flow_client.generate_video_edit(
                     at=token.at, project_id=project_id, prompt=prompt,
                     source_media_id=source_media_id,

@@ -5,6 +5,7 @@ batchexecute.  This mixin overrides every runtime path that previously called
 the retired Labs tRPC and AI Sandbox REST endpoints.
 """
 
+import asyncio
 import base64
 import re
 import time
@@ -419,7 +420,6 @@ class CurrentFlowClientMixin:
             "X-Goog-Upload-Protocol": "resumable",
             "X-Goog-Upload-Command": "start",
             "X-Goog-Upload-Header-Content-Length": str(len(video_bytes)),
-            "X-Goog-Upload-Header-Content-Type": mime_type,
         })
         upload_root = f"https://flow.google.com/upload/v1/flow/upload/video/{project_id}"
         async with AsyncSession(
@@ -450,9 +450,11 @@ class CurrentFlowClientMixin:
 
             finish_headers = dict(headers)
             finish_headers.update({
+                "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
                 "X-Goog-Upload-Command": "upload, finalize",
                 "X-Goog-Upload-Offset": "0",
             })
+            finish_headers.pop("X-Goog-Upload-Header-Content-Length", None)
             finish = await session.post(
                 upload_url,
                 headers=finish_headers,
@@ -474,6 +476,45 @@ class CurrentFlowClientMixin:
         if not media_id:
             raise RuntimeError("Flow video upload response missing mediaId")
         return media_id
+
+    async def wait_for_video_media_ready(
+        self,
+        media_id: str,
+        project_id: str,
+        *,
+        google_cookies: Optional[str] = None,
+        token_id: Optional[int] = None,
+        timeout: float = 120,
+        poll_interval: float = 4.0,
+    ) -> None:
+        """Uploading returns before Flow has processed the source for editing."""
+        if not self._is_uuid(media_id) or not self._is_uuid(project_id):
+            raise ValueError("Flow video readiness requires UUID media and project IDs")
+        deadline = time.monotonic() + max(0, timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Flow uploaded video processing timed out")
+            payload = await asyncio.wait_for(
+                self._current_rpc(
+                    rpc_id="as29s",
+                    argument=[media_id],
+                    google_cookies=google_cookies,
+                    token_id=token_id,
+                    project_id=project_id,
+                ),
+                timeout=remaining,
+            )
+            error = self._extract_frontend_rpc_error_code(payload)
+            if error:
+                raise RuntimeError(f"Flow uploaded video processing failed: {error}")
+            if (isinstance(payload, list) and len(payload) > 1
+                    and payload[0] == media_id and payload[1] == project_id
+                    and self._find_flow_content_url(payload, "video")):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(max(0.5, poll_interval), remaining))
 
     async def generate_image(
         self,
