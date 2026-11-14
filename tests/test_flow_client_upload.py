@@ -49,6 +49,45 @@ class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.calls), 2)
         self.assertEqual(session.calls[0][1]["headers"]["X-Goog-Upload-Command"], "start")
         self.assertEqual(session.calls[1][1]["headers"]["X-Goog-Upload-Command"], "upload, finalize")
+        self.assertNotIn("X-Goog-Upload-Header-Content-Type", session.calls[0][1]["headers"])
+        self.assertNotIn("X-Goog-Upload-Header-Content-Length", session.calls[1][1]["headers"])
+
+    async def test_video_readiness_waits_for_matching_media_video_url(self):
+        client = FlowClient(proxy_manager=None)
+        client._current_rpc = AsyncMock(side_effect=[
+            [MEDIA_ID, PROJECT_ID, "processing"],
+            [PROJECT_ID, MEDIA_ID, "https://flow-content.google/video/wrong-media"],
+            [MEDIA_ID, PROJECT_ID, "https://flow-content.google/video/ready"],
+        ])
+        with patch("src.services.flow_current.asyncio.sleep", new=AsyncMock()):
+            await client.wait_for_video_media_ready(
+                MEDIA_ID, PROJECT_ID, google_cookies="SID=session-cookie", token_id=1,
+            )
+        self.assertEqual(client._current_rpc.await_count, 3)
+        self.assertEqual(client._current_rpc.await_args.kwargs["rpc_id"], "as29s")
+        self.assertEqual(client._current_rpc.await_args.kwargs["argument"], [MEDIA_ID])
+
+    async def test_video_readiness_stops_on_processing_error(self):
+        client = FlowClient(proxy_manager=None)
+        client._current_rpc = AsyncMock(return_value=["PUBLIC_ERROR_UNSAFE_GENERATION"])
+        with self.assertRaisesRegex(RuntimeError, "processing failed"):
+            await client.wait_for_video_media_ready(MEDIA_ID, PROJECT_ID)
+
+    async def test_video_readiness_deadline_bounds_slow_rpc(self):
+        import asyncio
+        client = FlowClient(proxy_manager=None)
+        async def slow_rpc(**kwargs):
+            await asyncio.sleep(1)
+        client._current_rpc = AsyncMock(side_effect=slow_rpc)
+        with self.assertRaises(TimeoutError):
+            await client.wait_for_video_media_ready(MEDIA_ID, PROJECT_ID, timeout=0.01)
+
+    async def test_video_readiness_rejects_invalid_ids_without_rpc(self):
+        client = FlowClient(proxy_manager=None)
+        client._current_rpc = AsyncMock()
+        with self.assertRaises(ValueError):
+            await client.wait_for_video_media_ready("not-a-uuid", PROJECT_ID)
+        client._current_rpc.assert_not_awaited()
 
     async def test_upload_uses_current_frontend_rpc(self):
         client = FlowClient(proxy_manager=None)
