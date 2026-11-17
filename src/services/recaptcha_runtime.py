@@ -107,12 +107,24 @@ RECAPTCHA_EXECUTE_SOURCE = r"""(async (siteKey, requestedAction, timeoutMs) => {
                     window.grecaptcha &&
                     window.grecaptcha.enterprise &&
                     typeof window.grecaptcha.enterprise.render === 'function' &&
-                    window.__flow2apiRecaptchaClientId === undefined
+                    window.__flow2apiRecaptchaClientId === undefined &&
+                    typeof document !== 'undefined' &&
+                    typeof document.createElement === 'function'
                 ) {
+                    let container = document.getElementById('__flow2api_recaptcha_container');
+                    if (!container) {
+                        container = document.createElement('div');
+                        container.id = '__flow2api_recaptcha_container';
+                        container.style.display = 'none';
+                        (document.body || document.documentElement).appendChild(container);
+                    }
+                    while (container.firstChild) {
+                        container.removeChild(container.firstChild);
+                    }
                     window.__flow2apiRecaptchaClientId =
                         window.grecaptcha.enterprise.render(
-                            document.documentElement,
-                            { sitekey: siteKey, action: requestedAction }
+                            container,
+                            { sitekey: siteKey, action: requestedAction, size: 'invisible' }
                         );
                 }
                 if (window.__flow2apiRecaptchaClientId !== undefined) {
