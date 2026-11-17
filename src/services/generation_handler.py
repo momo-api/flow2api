@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import math
 import time
@@ -19,6 +20,7 @@ from ..core.account_tiers import (
     supports_model_for_tier,
 )
 from .file_cache import FileCache
+from . import r2_storage
 
 
 def _video_poll_attempt_budget(
@@ -2669,6 +2671,149 @@ class GenerationHandler:
             if acquired_image_slot and concurrency_mgr is not None:
                 await concurrency_mgr.release_image(token.id)
 
+    @staticmethod
+    def _detect_video_upload_meta(video_bytes: bytes) -> tuple[str, str]:
+        if len(video_bytes) >= 4 and video_bytes[:4] == b"\x1a\x45\xdf\xa3":
+            return "video/webm", "flow2api_video.webm"
+        if len(video_bytes) >= 12 and video_bytes[4:8] == b"ftyp" and b"qt  " in video_bytes[8:16]:
+            return "video/quicktime", "flow2api_video.mov"
+        return "video/mp4", "flow2api_video.mp4"
+
+    async def _get_cached_media_id(
+        self, sha256: str, token_id: Optional[int], project_id: str, kind: str
+    ) -> Optional[str]:
+        if (
+            not sha256
+            or token_id is None
+            or not project_id
+            or not self.db
+            or not hasattr(self.db, "get_cached_media_asset")
+        ):
+            return None
+        try:
+            return await self.db.get_cached_media_asset(sha256, token_id, project_id, kind)
+        except Exception:
+            return None
+
+    async def _save_cached_media_id(
+        self,
+        sha256: str,
+        token_id: Optional[int],
+        project_id: str,
+        media_id: str,
+        kind: str,
+        mime_type: str = "",
+    ) -> None:
+        if (
+            not (sha256 and media_id and project_id)
+            or token_id is None
+            or not self.db
+            or not hasattr(self.db, "save_cached_media_asset")
+        ):
+            return
+        try:
+            await self.db.save_cached_media_asset(
+                sha256, token_id, project_id, media_id, kind, mime_type=mime_type
+            )
+        except Exception:
+            pass
+
+    async def _invalidate_cached_media_id(
+        self, sha256: str, token_id: Optional[int], project_id: str, kind: str
+    ) -> None:
+        if (
+            not sha256
+            or token_id is None
+            or not project_id
+            or not self.db
+            or not hasattr(self.db, "delete_cached_media_asset")
+        ):
+            return
+        try:
+            await self.db.delete_cached_media_asset(sha256, token_id, project_id, kind)
+        except Exception:
+            pass
+
+    async def _upload_media_image_with_cache(
+        self,
+        token,
+        project_id: str,
+        image_bytes: bytes,
+        aspect_ratio: str,
+    ) -> tuple[str, bool, str]:
+        digest = hashlib.sha256(image_bytes).hexdigest()
+        cached_id = await self._get_cached_media_id(
+            digest, getattr(token, "id", None), project_id, "image"
+        )
+        if cached_id:
+            return cached_id, True, digest
+        media_id = await self.flow_client.upload_image(
+            token.at,
+            image_bytes,
+            aspect_ratio,
+            project_id=project_id,
+            token_id=getattr(token, "id", None),
+            google_cookies=getattr(token, "google_cookies", None),
+        )
+        await self._save_cached_media_id(
+            digest, getattr(token, "id", None), project_id, media_id, "image"
+        )
+        return media_id, False, digest
+
+    async def _upload_images_with_cache(
+        self,
+        token,
+        project_id: str,
+        images: List[bytes],
+        aspect_ratio: str,
+    ) -> List[tuple[str, bool, str]]:
+        semaphore = asyncio.Semaphore(3)
+
+        async def _upload_one(img_bytes: bytes) -> tuple[str, bool, str]:
+            async with semaphore:
+                return await self._upload_media_image_with_cache(
+                    token, project_id, img_bytes, aspect_ratio
+                )
+
+        return list(await asyncio.gather(*(_upload_one(img) for img in images)))
+
+    async def _upload_source_video_with_cache(
+        self,
+        token,
+        project_id: str,
+        source_video: bytes,
+    ) -> tuple[str, bool, str]:
+        digest = hashlib.sha256(source_video).hexdigest()
+        cached_id = await self._get_cached_media_id(
+            digest, getattr(token, "id", None), project_id, "video"
+        )
+        if cached_id:
+            return cached_id, True, digest
+        mime_type, filename = self._detect_video_upload_meta(source_video)
+        source_media_id = await self.flow_client.upload_video(
+            source_video,
+            project_id,
+            filename=filename,
+            mime_type=mime_type,
+            token_id=getattr(token, "id", None),
+            google_cookies=getattr(token, "google_cookies", None),
+        )
+        await self.flow_client.wait_for_video_media_ready(
+            source_media_id,
+            project_id,
+            token_id=getattr(token, "id", None),
+            google_cookies=getattr(token, "google_cookies", None),
+        )
+        await self._save_cached_media_id(
+            digest,
+            getattr(token, "id", None),
+            project_id,
+            source_media_id,
+            "video",
+            mime_type=mime_type,
+        )
+        return source_media_id, False, digest
+
     async def _handle_video_generation(
         self,
         token,
@@ -2754,9 +2899,11 @@ class GenerationHandler:
             model_config["model_key"] = model_key
 
             if source_video is not None:
-                if (video_type != "omni" or resolution != "360p" or images
+                if (video_type != "omni" or resolution != "360p"
                         or first_frame is not None or last_frame is not None):
-                    raise ValueError("Video editing cannot be mixed with frame/image generation")
+                    raise ValueError("Video editing cannot be mixed with frame generation")
+                if images and len(images) > 3:
+                    raise ValueError("Video editing supports at most 3 reference images")
                 video_type = "material"
                 video_trace = perf_trace.setdefault("video_generation", {}) if isinstance(perf_trace, dict) else None
                 if video_trace is not None:
@@ -2872,18 +3019,13 @@ class GenerationHandler:
                         f"上传 {image_count} 张参考图片...\n"
                     )
 
-                for img in images:
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
-                        img,
-                        model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
-                    )
+                uploaded_refs = await self._upload_images_with_cache(
+                    token, project_id, images, model_config["aspect_ratio"]
+                )
+                for media_id, _, _ in uploaded_refs:
                     reference_images.append(
                         {
-                        "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
+                            "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
                             "mediaId": media_id,
                         }
                     )
@@ -2898,18 +3040,13 @@ class GenerationHandler:
                         f"上传 {image_count} 张 Omni 参考图片...\n"
                     )
 
-                for img in images:
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
-                        img,
-                        model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
-                    )
+                uploaded_refs = await self._upload_images_with_cache(
+                    token, project_id, images, model_config["aspect_ratio"]
+                )
+                for media_id, _, _ in uploaded_refs:
                     reference_images.append(
                         {
-                        "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
+                            "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
                             "mediaId": media_id,
                         }
                     )
@@ -2924,24 +3061,70 @@ class GenerationHandler:
 
             # I2V: 首尾帧生成
             if video_type == "material":
-                source_media_id = await self.flow_client.upload_video(
-                    source_video, project_id, token_id=token.id,
-                    google_cookies=getattr(token, "google_cookies", None),
+                async def _prepare_material_inputs():
+                    video_coro = self._upload_source_video_with_cache(
+                        token, project_id, source_video
+                    )
+                    if images:
+                        imgs_coro = self._upload_images_with_cache(
+                            token, project_id, images, model_config["aspect_ratio"]
+                        )
+                        return await asyncio.gather(video_coro, imgs_coro)
+                    return await video_coro, []
+
+                (source_media_id, video_from_cache, video_sha), ref_uploads = (
+                    await _prepare_material_inputs()
                 )
-                await self.flow_client.wait_for_video_media_ready(
-                    source_media_id, project_id, token_id=token.id,
-                    google_cookies=getattr(token, "google_cookies", None),
-                )
-                result = await self.flow_client.generate_video_edit(
-                    at=token.at, project_id=project_id, prompt=prompt,
-                    source_media_id=source_media_id,
-                    source_start_frame=source_start_frame,
-                    source_end_frame=source_end_frame,
-                    aspect_ratio=model_config["aspect_ratio"],
-                    user_paygate_tier=normalized_tier, token_id=token.id,
-                    token_video_concurrency=token.video_concurrency,
-                    google_cookies=getattr(token, "google_cookies", None),
-                )
+                ref_media_ids = [mid for mid, _, _ in ref_uploads] or None
+                try:
+                    result = await self.flow_client.generate_video_edit(
+                        at=token.at,
+                        project_id=project_id,
+                        prompt=prompt,
+                        source_media_id=source_media_id,
+                        source_start_frame=source_start_frame,
+                        source_end_frame=source_end_frame,
+                        reference_media_ids=ref_media_ids,
+                        aspect_ratio=model_config["aspect_ratio"],
+                        user_paygate_tier=normalized_tier,
+                        token_id=token.id,
+                        token_video_concurrency=token.video_concurrency,
+                        google_cookies=getattr(token, "google_cookies", None),
+                    )
+                except Exception as edit_exc:
+                    any_cached = video_from_cache or any(
+                        from_cache for _, from_cache, _ in ref_uploads
+                    )
+                    err_lower = str(edit_exc).lower()
+                    if any_cached and any(
+                        hint in err_lower
+                        for hint in ("not_found", "not found", "invalid_argument", "code=[5]", "media")
+                    ):
+                        await self._invalidate_cached_media_id(
+                            video_sha, getattr(token, "id", None), project_id, "video"
+                        )
+                        for _, _, img_sha in ref_uploads:
+                            await self._invalidate_cached_media_id(
+                                img_sha, getattr(token, "id", None), project_id, "image"
+                            )
+                        (source_media_id, _, _), ref_uploads = await _prepare_material_inputs()
+                        ref_media_ids = [mid for mid, _, _ in ref_uploads] or None
+                        result = await self.flow_client.generate_video_edit(
+                            at=token.at,
+                            project_id=project_id,
+                            prompt=prompt,
+                            source_media_id=source_media_id,
+                            source_start_frame=source_start_frame,
+                            source_end_frame=source_end_frame,
+                            reference_media_ids=ref_media_ids,
+                            aspect_ratio=model_config["aspect_ratio"],
+                            user_paygate_tier=normalized_tier,
+                            token_id=token.id,
+                            token_video_concurrency=token.video_concurrency,
+                            google_cookies=getattr(token, "google_cookies", None),
+                        )
+                    else:
+                        raise
             elif video_type == "i2v" and start_media_id:
                 if end_media_id:
                     # 有首尾帧
@@ -3407,30 +3590,46 @@ class GenerationHandler:
                             "续写片段已生成；当前 Flow 前端未提供媒体拼接 RPC，返回续写片段。\n"
                         )
 
-                    # 缓存视频 (如果启用)
+                    # 缓存视频 / 上传至 24h R2 临时桶 (如果启用)
+                    task_id = operation["operation"]["name"]
                     local_url = video_url
-                    if config.cache_enabled:
+                    r2_enabled = r2_storage.is_r2_video_storage_configured()
+                    if config.cache_enabled or r2_enabled:
                         await self._update_request_log_progress(
                             request_log_state,
                             token_id=token.id,
                             status_text="caching_video",
                             progress=92,
                         )
+                        cached_path: Optional[Path] = None
                         try:
                             if stream:
                                 yield self._create_stream_chunk("正在缓存视频文件...\n")
                             cached_filename = await self.file_cache.download_and_cache(
                                 video_url, "video"
                             )
-                            local_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                            cache_dir = getattr(self.file_cache, "cache_dir", None)
+                            if cache_dir is not None:
+                                candidate = Path(cache_dir) / cached_filename
+                                if candidate.is_file():
+                                    cached_path = candidate
+                            if config.cache_enabled:
+                                local_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                            if r2_enabled and cached_path is not None:
+                                r2_res = await r2_storage.upload_video_file(
+                                    cached_path, task_id=task_id
+                                )
+                                if r2_res and r2_res.get("url"):
+                                    local_url = r2_res["url"]
                             if stream:
                                 yield self._create_stream_chunk(
                                     "✅ 视频缓存成功,准备返回缓存地址...\n"
                                 )
                         except Exception as e:
                             debug_logger.log_error(f"Failed to cache video: {str(e)}")
-                            # 缓存失败不影响结果返回,使用原始URL
-                            local_url = video_url
+                            # R2 或缓存失败不影响结果返回,若本地缓存已存在保留本地地址，否则回退源链接
+                            if not config.cache_enabled or local_url == video_url:
+                                local_url = video_url
                             if stream:
                                 cache_error = self._normalize_error_message(
                                     e, max_length=120
@@ -3438,6 +3637,12 @@ class GenerationHandler:
                                 yield self._create_stream_chunk(
                                     f"⚠️ 缓存失败: {cache_error}\n正在返回源链接...\n"
                                 )
+                        finally:
+                            if not config.cache_enabled and cached_path is not None:
+                                try:
+                                    cached_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
                     else:
                         if stream:
                             yield self._create_stream_chunk(
@@ -3445,7 +3650,6 @@ class GenerationHandler:
                             )
 
                     # 更新数据库
-                    task_id = operation["operation"]["name"]
                     await self.db.update_task(
                         task_id,
                         status="completed",

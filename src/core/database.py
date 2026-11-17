@@ -3,6 +3,7 @@
 import asyncio
 import aiosqlite
 import json
+import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Optional, List, Dict, Any
@@ -986,6 +987,20 @@ class Database:
                 )
             """)
 
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS media_asset_cache (
+                    sha256 TEXT NOT NULL,
+                    token_id INTEGER NOT NULL,
+                    project_id TEXT NOT NULL,
+                    media_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    mime_type TEXT DEFAULT '',
+                    verified_at REAL NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (sha256, token_id, project_id, kind)
+                )
+            """)
+
             # Create indexes
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_token_st ON tokens(st)")
@@ -1542,6 +1557,88 @@ class Database:
                 query = f"UPDATE tasks SET {', '.join(updates)} WHERE task_id = ?"
                 await db.execute(query, params)
                 await db.commit()
+
+    async def get_cached_media_asset(
+        self,
+        sha256: str,
+        token_id: int,
+        project_id: str,
+        kind: str,
+        *,
+        max_age_seconds: int = 82800,
+    ) -> Optional[str]:
+        """Look up a previously uploaded Flow media_id for the same bytes, token, and project."""
+        if not (sha256 and token_id is not None and project_id and kind):
+            return None
+        cutoff = time.time() - max(60, int(max_age_seconds))
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                SELECT media_id, verified_at
+                FROM media_asset_cache
+                WHERE sha256 = ? AND token_id = ? AND project_id = ? AND kind = ?
+                """,
+                (sha256, int(token_id), str(project_id), str(kind)),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            media_id, verified_at = row[0], float(row[1] or 0)
+            if verified_at < cutoff:
+                return None
+            return str(media_id or "").strip() or None
+
+    async def save_cached_media_asset(
+        self,
+        sha256: str,
+        token_id: int,
+        project_id: str,
+        media_id: str,
+        kind: str,
+        mime_type: str = "",
+    ) -> None:
+        """Persist a verified Flow media_id for reuse across retries or repeated generations."""
+        if not (sha256 and token_id is not None and project_id and media_id and kind):
+            return
+        now_ts = time.time()
+        async with self._connect(write=True) as db:
+            await db.execute(
+                """
+                INSERT INTO media_asset_cache (sha256, token_id, project_id, media_id, kind, mime_type, verified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sha256, token_id, project_id, kind) DO UPDATE SET
+                    media_id = excluded.media_id,
+                    mime_type = excluded.mime_type,
+                    verified_at = excluded.verified_at
+                """,
+                (sha256, int(token_id), str(project_id), str(media_id), str(kind), str(mime_type or ""), now_ts),
+            )
+            # Prune stale entries older than 48 hours periodically
+            await db.execute(
+                "DELETE FROM media_asset_cache WHERE verified_at < ?",
+                (now_ts - 172800,),
+            )
+            await db.commit()
+
+    async def delete_cached_media_asset(
+        self,
+        sha256: str,
+        token_id: int,
+        project_id: str,
+        kind: str,
+    ) -> None:
+        """Remove a cached Flow media_id (for example after upstream reports it stale)."""
+        if not (sha256 and token_id is not None and project_id and kind):
+            return
+        async with self._connect(write=True) as db:
+            await db.execute(
+                """
+                DELETE FROM media_asset_cache
+                WHERE sha256 = ? AND token_id = ? AND project_id = ? AND kind = ?
+                """,
+                (sha256, int(token_id), str(project_id), str(kind)),
+            )
+            await db.commit()
 
     # Token stats operations (kept for compatibility, now delegates to specific methods)
     async def increment_token_stats(self, token_id: int, stat_type: str):

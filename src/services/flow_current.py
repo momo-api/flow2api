@@ -24,6 +24,12 @@ from .flow_cookies import FlowCookieJar
 # 视频提交被 PUBLIC_ERROR_UNUSUAL_ACTIVITY 拒绝时，同账号最多再重试的次数；
 # 之后交给上层切换账号（同账号同 IP 立刻重试大概率仍被风控）。
 UNUSUAL_ACTIVITY_SAME_TOKEN_RETRIES = 1
+_VIDEO_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+_UPLOAD_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+
+class _RetryableUploadError(RuntimeError):
+    """Transient upload error eligible for bounded retry."""
 
 def _safe_updated_flow_cookies(owner, original) -> str:
     """读取 Cookie 最新快照，缺失实现时安全降级。
@@ -325,56 +331,74 @@ class CurrentFlowClientMixin:
         mime_type = self._detect_image_mime_type(image_bytes)
         extension = "png" if "png" in mime_type else "jpg"
         filename = f"flow2api_{uuid.uuid4().hex[:12]}.{extension}"
-        recaptcha_token, browser_id = await self._get_recaptcha_token(
-            normalized_project_id,
-            action="UPLOAD_IMAGE",
-            token_id=token_id,
-            website_url=self._build_flow_frontend_project_page_url(
-                normalized_project_id
-            ),
-        )
-        if not recaptcha_token:
-            raise RuntimeError("Failed to obtain reCAPTCHA token for image upload")
-        try:
-            context = self._frontend_project_context(
+        encoded_image = base64.b64encode(image_bytes).decode("ascii")
+        is_transient = getattr(self, "_is_retryable_network_error", None)
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            recaptcha_token, browser_id = await self._get_recaptcha_token(
                 normalized_project_id,
-                recaptcha_token,
-            )
-            payload = await self._current_rpc(
-                rpc_id="maseQ",
-                argument=[
-                    context,
-                    base64.b64encode(image_bytes).decode("ascii"),
-                    mime_type,
-                    1,
-                    None,
-                    None,
-                    None,
-                    None,
-                    filename,
-                    None,
-                    str(uuid.uuid4()).upper(),
-                    str(uuid.uuid4()).upper(),
-                ],
-                google_cookies=google_cookies,
+                action="UPLOAD_IMAGE",
                 token_id=token_id,
-                project_id=normalized_project_id,
-                timeout=max(self._get_control_plane_timeout(), 90),
+                website_url=self._build_flow_frontend_project_page_url(
+                    normalized_project_id
+                ),
             )
-            media_url = self._find_flow_content_url(payload, "image")
-            media_id = ""
-            if media_url:
-                match = re.search(r"/image/([0-9a-f-]{36})", media_url, re.I)
-                media_id = match.group(1) if match else ""
-            media_id = media_id or self._find_uuid_value(
-                payload,
-                excluded={normalized_project_id},
-            )
-            if not media_id:
-                raise RuntimeError("Flow frontend upload response missing mediaId")
-            return media_id
-        finally:
-            await self._notify_browser_captcha_request_finished(browser_id)
+            if not recaptcha_token:
+                raise RuntimeError("Failed to obtain reCAPTCHA token for image upload")
+            try:
+                context = self._frontend_project_context(
+                    normalized_project_id,
+                    recaptcha_token,
+                )
+                payload = await self._current_rpc(
+                    rpc_id="maseQ",
+                    argument=[
+                        context,
+                        encoded_image,
+                        mime_type,
+                        1,
+                        None,
+                        None,
+                        None,
+                        None,
+                        filename,
+                        None,
+                        str(uuid.uuid4()).upper(),
+                        str(uuid.uuid4()).upper(),
+                    ],
+                    google_cookies=google_cookies,
+                    token_id=token_id,
+                    project_id=normalized_project_id,
+                    timeout=max(self._get_control_plane_timeout(), 90),
+                )
+                media_url = self._find_flow_content_url(payload, "image")
+                media_id = ""
+                if media_url:
+                    match = re.search(r"/image/([0-9a-f-]{36})", media_url, re.I)
+                    media_id = match.group(1) if match else ""
+                media_id = media_id or self._find_uuid_value(
+                    payload,
+                    excluded={normalized_project_id},
+                )
+                if not media_id:
+                    raise RuntimeError("Flow frontend upload response missing mediaId")
+                return media_id
+            except Exception as exc:
+                last_error = exc
+                lower = str(exc).lower()
+                retryable = bool(
+                    (callable(is_transient) and is_transient(str(exc)))
+                    or any(code in lower for code in ("429", "500", "502", "503", "504", "temporarily"))
+                )
+                if not retryable or attempt >= 2:
+                    raise
+                debug_logger.log_warning(
+                    f"[UPLOAD_IMAGE] 图片上传遇到瞬时错误，准备重试 ({attempt + 2}/3): {exc}"
+                )
+            finally:
+                await self._notify_browser_captcha_request_finished(browser_id)
+            await asyncio.sleep(min(1.0 * (attempt + 1), 3.0))
+        raise last_error or RuntimeError("Flow frontend image upload failed")
 
     async def upload_video(
         self,
@@ -385,7 +409,7 @@ class CurrentFlowClientMixin:
         token_id: Optional[int] = None,
         google_cookies: Optional[str] = None,
     ) -> str:
-        """Upload a video through Flow's resumable project media endpoint."""
+        """Upload a video through Flow's resumable project media endpoint with chunking and retries."""
         project_id = str(project_id or "").strip()
         if not project_id:
             raise ValueError("Flow frontend video upload requires project_id")
@@ -397,13 +421,15 @@ class CurrentFlowClientMixin:
             raise ValueError("Unsupported video MIME type")
         if not filename or any(c in filename for c in "\r\n/\\"):
             raise ValueError("Invalid video filename")
+        if filename == "flow2api_video.mp4" and mime_type != "video/mp4":
+            ext = "webm" if mime_type == "video/webm" else "mov"
+            filename = f"flow2api_video.{ext}"
 
         storage = await self._resolve_flow_frontend_cookie_storage(
             google_cookies=google_cookies, token_id=token_id
         )
         if not storage:
             raise RuntimeError("Flow video upload requires Google session cookies")
-        cookie_jar = FlowCookieJar(self.get_updated_flow_cookies(storage))
         page_url = self._build_flow_frontend_project_page_url(project_id)
         proxy = None
         if self.proxy_manager:
@@ -422,60 +448,93 @@ class CurrentFlowClientMixin:
             "X-Goog-Upload-Header-Content-Length": str(len(video_bytes)),
         })
         upload_root = f"https://flow.google.com/upload/v1/flow/upload/video/{project_id}"
-        async with AsyncSession(
-            trust_env=False, cookies=cookie_jar, curl_infos=[CurlInfo.COOKIELIST]
-        ) as session:
-            session.curl_options[CurlOpt.COOKIE] = cookie_jar.extra_cookie_header(page_url)
-            start = await session.post(
-                upload_root,
-                headers=headers,
-                data=b"",
-                proxy=proxy,
-                timeout=max(self._get_control_plane_timeout(), 90),
-                impersonate=self._resolve_runtime_impersonate(),
-                allow_redirects=False,
-            )
-            self._update_flow_cookie_jar(cookie_jar, start)
-            self._remember_flow_cookies(storage, cookie_jar)
-            if start.status_code != 200:
-                raise RuntimeError(f"Flow video upload start failed: HTTP {start.status_code}")
-            upload_url = start.headers.get("x-goog-upload-url")
-            if not upload_url:
-                raise RuntimeError("Flow video upload start returned no upload URL")
-            target = urlparse(upload_url)
-            if (target.scheme != "https" or target.netloc != "flow.google.com"
-                    or target.path != urlparse(upload_root).path
-                    or target.username or target.fragment):
-                raise RuntimeError("Flow returned an unsafe upload URL")
+        is_transient = getattr(self, "_is_retryable_network_error", None)
+        last_error: Optional[Exception] = None
 
-            finish_headers = dict(headers)
-            finish_headers.update({
-                "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
-                "X-Goog-Upload-Command": "upload, finalize",
-                "X-Goog-Upload-Offset": "0",
-            })
-            finish_headers.pop("X-Goog-Upload-Header-Content-Length", None)
-            finish = await session.post(
-                upload_url,
-                headers=finish_headers,
-                data=video_bytes,
-                proxy=proxy,
-                timeout=max(self._get_control_plane_timeout(), 180),
-                impersonate=self._resolve_runtime_impersonate(),
-                allow_redirects=False,
-            )
-            self._update_flow_cookie_jar(cookie_jar, finish)
-            self._remember_flow_cookies(storage, cookie_jar)
-            if finish.status_code != 200:
-                raise RuntimeError(f"Flow video upload failed: HTTP {finish.status_code}")
+        for attempt in range(3):
+            cookie_jar = FlowCookieJar(self.get_updated_flow_cookies(storage))
             try:
-                payload = finish.json()
+                async with AsyncSession(
+                    trust_env=False, cookies=cookie_jar, curl_infos=[CurlInfo.COOKIELIST]
+                ) as session:
+                    session.curl_options[CurlOpt.COOKIE] = cookie_jar.extra_cookie_header(page_url)
+                    start = await session.post(
+                        upload_root,
+                        headers=headers,
+                        data=b"",
+                        proxy=proxy,
+                        timeout=max(self._get_control_plane_timeout(), 90),
+                        impersonate=self._resolve_runtime_impersonate(),
+                        allow_redirects=False,
+                    )
+                    self._update_flow_cookie_jar(cookie_jar, start)
+                    self._remember_flow_cookies(storage, cookie_jar)
+                    if start.status_code != 200:
+                        msg = f"Flow video upload start failed: HTTP {start.status_code}"
+                        if start.status_code in _UPLOAD_RETRYABLE_STATUS_CODES:
+                            raise _RetryableUploadError(msg)
+                        raise RuntimeError(msg)
+                    upload_url = start.headers.get("x-goog-upload-url")
+                    if not upload_url:
+                        raise RuntimeError("Flow video upload start returned no upload URL")
+                    target = urlparse(upload_url)
+                    if (target.scheme != "https" or target.netloc != "flow.google.com"
+                            or target.path != urlparse(upload_root).path
+                            or target.username or target.fragment):
+                        raise RuntimeError("Flow returned an unsafe upload URL")
+
+                    base_chunk_headers = dict(headers)
+                    base_chunk_headers["Content-Type"] = "application/x-www-form-urlencoded;charset=utf-8"
+                    base_chunk_headers.pop("X-Goog-Upload-Header-Content-Length", None)
+                    total_bytes = len(video_bytes)
+                    offset = 0
+                    finish = None
+                    while offset < total_bytes:
+                        end_offset = min(offset + _VIDEO_UPLOAD_CHUNK_BYTES, total_bytes)
+                        is_final = end_offset >= total_bytes
+                        chunk_headers = dict(base_chunk_headers)
+                        chunk_headers["X-Goog-Upload-Command"] = "upload, finalize" if is_final else "upload"
+                        chunk_headers["X-Goog-Upload-Offset"] = str(offset)
+                        chunk_data = video_bytes if offset == 0 and is_final else bytes(memoryview(video_bytes)[offset:end_offset])
+                        session.curl_options[CurlOpt.COOKIE] = cookie_jar.extra_cookie_header(upload_url)
+                        resp = await session.post(
+                            upload_url,
+                            headers=chunk_headers,
+                            data=chunk_data,
+                            proxy=proxy,
+                            timeout=max(self._get_control_plane_timeout(), 180),
+                            impersonate=self._resolve_runtime_impersonate(),
+                            allow_redirects=False,
+                        )
+                        self._update_flow_cookie_jar(cookie_jar, resp)
+                        self._remember_flow_cookies(storage, cookie_jar)
+                        if resp.status_code != 200:
+                            msg = f"Flow video upload failed: HTTP {resp.status_code}"
+                            if resp.status_code in _UPLOAD_RETRYABLE_STATUS_CODES:
+                                raise _RetryableUploadError(msg)
+                            raise RuntimeError(msg)
+                        finish = resp
+                        offset = end_offset
+                    try:
+                        payload = finish.json()
+                    except Exception as exc:
+                        raise RuntimeError("Flow video upload returned invalid JSON") from exc
+                media_id = self._find_uuid_value(payload, excluded={project_id})
+                if not media_id:
+                    raise RuntimeError("Flow video upload response missing mediaId")
+                return media_id
             except Exception as exc:
-                raise RuntimeError("Flow video upload returned invalid JSON") from exc
-        media_id = self._find_uuid_value(payload, excluded={project_id})
-        if not media_id:
-            raise RuntimeError("Flow video upload response missing mediaId")
-        return media_id
+                last_error = exc
+                retryable = isinstance(exc, _RetryableUploadError) or (
+                    callable(is_transient) and is_transient(str(exc))
+                )
+                if not retryable or attempt >= 2:
+                    raise
+                debug_logger.log_warning(
+                    f"[UPLOAD_VIDEO] 视频上传遇到瞬时错误，准备重试 ({attempt + 2}/3): {exc}"
+                )
+                await asyncio.sleep(min(1.5 * (attempt + 1), 4.0))
+        raise last_error or RuntimeError("Flow video upload failed")
 
     async def wait_for_video_media_ready(
         self,
@@ -491,20 +550,34 @@ class CurrentFlowClientMixin:
         if not self._is_uuid(media_id) or not self._is_uuid(project_id):
             raise ValueError("Flow video readiness requires UUID media and project IDs")
         deadline = time.monotonic() + max(0, timeout)
+        consecutive_errors = 0
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Flow uploaded video processing timed out")
-            payload = await asyncio.wait_for(
-                self._current_rpc(
-                    rpc_id="as29s",
-                    argument=[media_id],
-                    google_cookies=google_cookies,
-                    token_id=token_id,
-                    project_id=project_id,
-                ),
-                timeout=remaining,
-            )
+            try:
+                payload = await asyncio.wait_for(
+                    self._current_rpc(
+                        rpc_id="as29s",
+                        argument=[media_id],
+                        google_cookies=google_cookies,
+                        token_id=token_id,
+                        project_id=project_id,
+                    ),
+                    timeout=remaining,
+                )
+                consecutive_errors = 0
+            except Exception as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Flow uploaded video processing timed out") from exc
+                consecutive_errors += 1
+                if consecutive_errors >= 3 or "code=" in str(exc).lower():
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Flow uploaded video processing timed out") from exc
+                await asyncio.sleep(min(max(0.5, poll_interval), remaining))
+                continue
             error = self._extract_frontend_rpc_error_code(payload)
             if error:
                 raise RuntimeError(f"Flow uploaded video processing failed: {error}")
@@ -930,6 +1003,7 @@ class CurrentFlowClientMixin:
         aspect_ratio: str,
         source_end_frame: int,
         source_start_frame: int = 0,
+        reference_media_ids: Optional[List[str]] = None,
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
@@ -941,6 +1015,7 @@ class CurrentFlowClientMixin:
             model_key="macaron_cookie_edit_360p",
             aspect_ratio=aspect_ratio,
             mode="edit",
+            reference_media_ids=reference_media_ids,
             start_media_id=source_media_id,
             token_id=token_id,
             token_video_concurrency=token_video_concurrency,

@@ -1,9 +1,11 @@
 """Current flow.google.com frontend RPC transport and response adapters."""
 
+import hashlib
 import json
 import contextvars
 import random
 import re
+import time
 import uuid
 from http.cookiejar import CookieJar
 from typing import Any, Dict, List, Optional
@@ -365,13 +367,21 @@ class FlowFrontendMixin:
                 raise ValueError("Video edit requires a source media ID and frame range")
             if model_key != "macaron_cookie_edit_360p":
                 raise ValueError("Unverified video edit model key")
-            # HAR entries 66/81/103: source range, prompt, key, ratio, metadata,
-            # seven absent fields, then the recorded edit-mode enum [4].
+            references = [
+                self._frontend_media_reference(media_id)
+                for media_id in (reference_media_ids or [])
+                if str(media_id or "").strip()
+            ] or None
+            if references and len(references) > 3:
+                raise ValueError("Video edit supports at most 3 reference images")
+            # HAR entries 66/81/103 & omini-sucai HARs: source range, prompt, key,
+            # ratio, metadata, three nulls, optional reference images at slot [0][8],
+            # three nulls, then the recorded edit-mode enum [4].
             rpc_id = "jIps6"
             request = [
                 [None, start_media_id, source_start_frame, source_end_frame],
                 prompt_message, model_key, aspect_value, metadata,
-                None, None, None, None, None, None, None, [4],
+                None, None, None, references, None, None, None, [4],
             ]
         elif normalized_mode == "references":
             references = [
@@ -715,7 +725,7 @@ class FlowFrontendMixin:
                     page_url,
                     headers=headers,
                     proxy=proxy_url,
-                    timeout=max(10, min(int(timeout or 30), 30)),
+                    timeout=max(20, min(int(timeout or 30), 45)),
                     impersonate=self._resolve_runtime_impersonate(),
                     allow_redirects=not bool(extra),
                 )
@@ -744,6 +754,18 @@ class FlowFrontendMixin:
             )
         return response.text
 
+    def _bootstrap_cache_store(self) -> Dict[tuple[str, str], Dict[str, Any]]:
+        store = getattr(self, "_frontend_bootstrap_cache", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._frontend_bootstrap_cache = store
+        return store
+
+    @staticmethod
+    def _bootstrap_cache_key(cookie_seed: str, source_path: str) -> tuple[str, str]:
+        digest = hashlib.sha256(str(cookie_seed or "").encode("utf-8")).hexdigest()[:24]
+        return (digest, source_path)
+
     async def _call_flow_frontend_rpc(
         self,
         rpc_id: str,
@@ -768,92 +790,129 @@ class FlowFrontendMixin:
         original_cookies = (
             cookie_storage if str(cookie_storage or "").strip() else cookie_header
         )
-        cookie_jar = FlowCookieJar(self.get_updated_flow_cookies(original_cookies))
-        bootstrap_text = await self._load_flow_frontend_bootstrap(
-            page_url,
-            bootstrap_cookie_header,
-            timeout,
-            cookie_jar=cookie_jar,
+        cache_key = self._bootstrap_cache_key(original_cookies, resolved_source_path)
+        cache_store = self._bootstrap_cache_store()
+        cached_meta = cache_store.get(cache_key)
+        now_mono = time.monotonic()
+        used_cached = (
+            isinstance(cached_meta, dict)
+            and (now_mono - float(cached_meta.get("fetched_at") or 0)) < 900.0
+            and bool(cached_meta.get("bootloader_id"))
+            and bool(cached_meta.get("frontend_session_id"))
         )
-        self._remember_flow_cookies(original_cookies, cookie_jar)
-        bootloader_match = re.search(
-            r"boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+",
-            bootstrap_text,
-        )
-        session_match = re.search(r'"FdrFJe":"(-?[0-9]+)"', bootstrap_text)
-        if not bootloader_match or not session_match:
-            raise RuntimeError("Flow frontend bootstrap metadata is unavailable")
-        bootloader_id = bootloader_match.group(0)
-        frontend_session_id = session_match.group(1)
-        request_counter = random.randint(10_000, 90_000)
-        url = (
-            "https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute"
-            f"?rpcids={quote(rpc_id, safe='')}"
-            f"&source-path={quote(resolved_source_path, safe='')}"
-            f"&bl={quote(bootloader_id, safe='')}"
-            f"&f.sid={frontend_session_id}&hl=en"
-            f"&_reqid={request_counter}&rt=c"
-        )
-        rpc_cookie_header = serialize_cookie_header_for_url(
-            cookie_jar.export_storage(), url
-        )
-        if not rpc_cookie_header:
-            raise RuntimeError("Flow frontend RPC requires Google session cookies")
-        headers = {
-            "Accept": "*/*",
-            "Accept-Language": self._get_primary_accept_language(
-                fallback="en-US,en;q=0.9"
-            ),
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            "Cookie": rpc_cookie_header,
-            "Origin": "https://flow.google.com",
-            "Referer": "https://flow.google.com/",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "x-same-domain": "1",
-        }
-        f_request = self._compact_json_dumps(
-            [[[rpc_id, self._compact_json_dumps(argument), None, "generic"]]]
-        )
-        request_fields = {"f.req": f_request}
-        at_token = self._extract_stream_chat_at_token(bootstrap_text)
-        if at_token:
-            request_fields["at"] = at_token
-        request_body = urlencode(request_fields)
-        response_text = await self._make_text_request(
-            method="POST",
-            url=url,
-            headers=headers,
-            raw_body=request_body,
-            timeout=timeout,
-            apply_default_client_headers=False,
-            return_error_response=True,
-            redact_sensitive_logs=True,
-            cookie_jar=cookie_jar,
-        )
-        xsrf_match = re.search(r'\["xsrf"\s*,\s*"((?:\\.|[^"\\])*)"', response_text)
-        if xsrf_match:
-            request_fields["at"] = json.loads('"' + xsrf_match.group(1) + '"')
-            response_text = await self._make_text_request(
-                method="POST",
-                url=url,
-                headers=headers,
-                raw_body=urlencode(request_fields),
-                timeout=timeout,
-                apply_default_client_headers=False,
-                return_error_response=True,
-                redact_sensitive_logs=True,
-                cookie_jar=cookie_jar,
-            )
 
-        frames = self._parse_batchexecute_frames(response_text)
-        self._raise_batchexecute_error(frames, rpc_id)
-        payload = self._extract_batchexecute_payload(frames, rpc_id)
-        if payload is None:
-            raise RuntimeError(f"Flow frontend RPC returned no payload: rpc={rpc_id}")
-        self._remember_flow_cookies(original_cookies, cookie_jar)
-        return payload
+        for bootstrap_attempt in range(2):
+            cookie_jar = FlowCookieJar(self.get_updated_flow_cookies(original_cookies))
+            if used_cached and bootstrap_attempt == 0:
+                bootloader_id = cached_meta["bootloader_id"]
+                frontend_session_id = cached_meta["frontend_session_id"]
+                at_token = cached_meta.get("at_token") or ""
+            else:
+                used_cached = False
+                bootstrap_text = await self._load_flow_frontend_bootstrap(
+                    page_url,
+                    bootstrap_cookie_header,
+                    timeout,
+                    cookie_jar=cookie_jar,
+                )
+                self._remember_flow_cookies(original_cookies, cookie_jar)
+                bootloader_match = re.search(
+                    r"boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+",
+                    bootstrap_text,
+                )
+                session_match = re.search(r'"FdrFJe":"(-?[0-9]+)"', bootstrap_text)
+                if not bootloader_match or not session_match:
+                    raise RuntimeError("Flow frontend bootstrap metadata is unavailable")
+                bootloader_id = bootloader_match.group(0)
+                frontend_session_id = session_match.group(1)
+                at_token = self._extract_stream_chat_at_token(bootstrap_text) or ""
+
+            request_counter = random.randint(10_000, 90_000)
+            url = (
+                "https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute"
+                f"?rpcids={quote(rpc_id, safe='')}"
+                f"&source-path={quote(resolved_source_path, safe='')}"
+                f"&bl={quote(bootloader_id, safe='')}"
+                f"&f.sid={frontend_session_id}&hl=en"
+                f"&_reqid={request_counter}&rt=c"
+            )
+            rpc_cookie_header = serialize_cookie_header_for_url(
+                cookie_jar.export_storage(), url
+            )
+            if not rpc_cookie_header:
+                raise RuntimeError("Flow frontend RPC requires Google session cookies")
+            headers = {
+                "Accept": "*/*",
+                "Accept-Language": self._get_primary_accept_language(
+                    fallback="en-US,en;q=0.9"
+                ),
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "Cookie": rpc_cookie_header,
+                "Origin": "https://flow.google.com",
+                "Referer": "https://flow.google.com/",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "x-same-domain": "1",
+            }
+            f_request = self._compact_json_dumps(
+                [[[rpc_id, self._compact_json_dumps(argument), None, "generic"]]]
+            )
+            request_fields = {"f.req": f_request}
+            if at_token:
+                request_fields["at"] = at_token
+            request_body = urlencode(request_fields)
+            try:
+                response_text = await self._make_text_request(
+                    method="POST",
+                    url=url,
+                    headers=headers,
+                    raw_body=request_body,
+                    timeout=timeout,
+                    apply_default_client_headers=False,
+                    return_error_response=True,
+                    redact_sensitive_logs=True,
+                    cookie_jar=cookie_jar,
+                )
+                xsrf_match = re.search(
+                    r'\["xsrf"\s*,\s*"((?:\\.|[^"\\])*)"', response_text
+                )
+                if xsrf_match:
+                    at_token = json.loads('"' + xsrf_match.group(1) + '"')
+                    request_fields["at"] = at_token
+                    response_text = await self._make_text_request(
+                        method="POST",
+                        url=url,
+                        headers=headers,
+                        raw_body=urlencode(request_fields),
+                        timeout=timeout,
+                        apply_default_client_headers=False,
+                        return_error_response=True,
+                        redact_sensitive_logs=True,
+                        cookie_jar=cookie_jar,
+                    )
+
+                frames = self._parse_batchexecute_frames(response_text)
+                self._raise_batchexecute_error(frames, rpc_id)
+                payload = self._extract_batchexecute_payload(frames, rpc_id)
+                if payload is None:
+                    raise RuntimeError(
+                        f"Flow frontend RPC returned no payload: rpc={rpc_id}"
+                    )
+                self._remember_flow_cookies(original_cookies, cookie_jar)
+                cache_store[cache_key] = {
+                    "bootloader_id": bootloader_id,
+                    "frontend_session_id": frontend_session_id,
+                    "at_token": at_token,
+                    "fetched_at": time.monotonic(),
+                }
+                return payload
+            except Exception:
+                cache_store.pop(cache_key, None)
+                if used_cached and bootstrap_attempt == 0:
+                    used_cached = False
+                    continue
+                raise
 
     @staticmethod
     def _extract_stream_chat_at_token(bootstrap_text: str) -> str:
