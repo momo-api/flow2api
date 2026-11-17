@@ -70,7 +70,7 @@ class OmniR2AndMaterialTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(rpc_id, "jIps6")
         req = argument[0][0]
-        self.assertEqual(req[0], [None, VIDEO_ID, 0, 245])
+        self.assertEqual(req[0], [None, VIDEO_ID, 0, 245, None, [], [10, 208333333]])
         self.assertEqual(req[2], "macaron_cookie_edit_360p")
         self.assertEqual(
             req[8],

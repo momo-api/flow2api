@@ -1349,6 +1349,9 @@ class _FlowClientBase(FlowFrontendMixin):
         if "public_error_user_quota_reached" in error_lower:
             # 账号额度不足，同号重试只会白白消耗打码；交给上层换号
             return None
+        if "code=[3]" in error_lower or "code=3" in error_lower or "invalid_argument" in error_lower:
+            # 参数或消息体不匹配错误，确定性失败，坚决不重试
+            return None
         if "403" in error_lower:
             return "403错误"
         if "429" in error_lower or "too many requests" in error_lower:

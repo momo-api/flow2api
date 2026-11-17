@@ -374,14 +374,36 @@ class FlowFrontendMixin:
             ] or None
             if references and len(references) > 3:
                 raise ValueError("Video edit supports at most 3 reference images")
-            # HAR entries 66/81/103 & omini-sucai HARs: source range, prompt, key,
-            # ratio, metadata, three nulls, optional reference images at slot [0][8],
+            # HAR entries 66/81/103 & omini-sucai HARs: source range (7 elements including duration),
+            # prompt, key, ratio, metadata, three nulls, optional reference images at slot [0][8],
             # three nulls, then the recorded edit-mode enum [4].
             rpc_id = "jIps6"
+            total_frames = max(1, source_end_frame - source_start_frame)
+            duration_seconds = total_frames / 24.0
+            dur_sec = int(duration_seconds)
+            dur_nanos = int(round((duration_seconds - dur_sec) * 1_000_000_000))
             request = [
-                [None, start_media_id, source_start_frame, source_end_frame],
-                prompt_message, model_key, aspect_value, metadata,
-                None, None, None, references, None, None, None, [4],
+                [
+                    None,
+                    start_media_id,
+                    source_start_frame,
+                    source_end_frame,
+                    None,
+                    [],
+                    [dur_sec, dur_nanos],
+                ],
+                prompt_message,
+                model_key,
+                aspect_value,
+                metadata,
+                None,
+                None,
+                None,
+                references,
+                None,
+                None,
+                None,
+                [4],
             ]
         elif normalized_mode == "references":
             references = [
