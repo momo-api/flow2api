@@ -6961,7 +6961,7 @@ class BrowserCaptchaService:
             explicit_domain = str(cookie.get("domain") or "").strip()
             google_family_scope = cls._is_google_family_cookie_host(scope_host)
 
-            if explicit_domain or not google_family_scope:
+            if explicit_domain or str(cookie.get("url") or "").strip() or not google_family_scope:
                 append_cookie(cookie)
 
             if not google_family_scope:
@@ -7021,7 +7021,7 @@ class BrowserCaptchaService:
             explicit_domain = str(cookie.get("domain") or "").strip()
             google_family_scope = cls._is_google_family_cookie_host(scope_host)
 
-            if explicit_domain or not google_family_scope:
+            if explicit_domain or str(cookie.get("url") or "").strip() or not google_family_scope:
                 append_cookie(cookie)
 
             if not google_family_scope:
