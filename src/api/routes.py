@@ -42,6 +42,7 @@ from ..core.models import (
 )
 from ..services.generation_handler import MODEL_CONFIG, GenerationHandler
 from ..services.browser_captcha_extension import ExtensionCaptchaService
+from ..services import r2_storage
 
 router = APIRouter()
 _background_video_tasks: Dict[str, asyncio.Task] = {}
@@ -361,25 +362,98 @@ async def _load_image_bytes_from_uri(uri: str) -> bytes:
     raise HTTPException(status_code=400, detail=f"Unsupported image URI: {uri}")
 
 
+_VIDEO_DATA_URI_RE = re.compile(
+    r"^data:video/(mp4|webm|quicktime)(?:;[^;,]+)*;base64,(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_MAX_REFERENCE_VIDEO_BYTES = 100 * 1024 * 1024
+_REMOTE_MEDIA_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _is_remote_http_url(uri: Any) -> bool:
+    if not isinstance(uri, str):
+        return False
+    lower = uri.strip().lower()
+    return lower.startswith("https://") or lower.startswith("http://")
+
+
+def _validate_remote_video_url(uri: str) -> str:
+    value = str(uri or "").strip()
+    if not _is_safe_remote_media_url(value):
+        raise HTTPException(status_code=400, detail="Unsupported or unsafe reference_video URL")
+    return value
+
+
+def _is_valid_video_container(data: bytes) -> bool:
+    if not data or len(data) > _MAX_REFERENCE_VIDEO_BYTES:
+        return False
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return True
+    if len(data) >= 4 and data[:4] == b"\x1a\x45\xdf\xa3":
+        return True
+    return False
+
+
+async def _download_remote_video_bytes(url: str) -> bytes:
+    safe_url = _validate_remote_video_url(url)
+    last_error: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            async with AsyncSession(trust_env=False) as session:
+                response = await session.get(
+                    safe_url,
+                    timeout=120,
+                    impersonate="chrome",
+                    allow_redirects=False,
+                )
+            if response.status_code == 200 and response.content:
+                data = response.content
+                if len(data) > _MAX_REFERENCE_VIDEO_BYTES:
+                    raise HTTPException(400, "Video exceeds 100 MiB")
+                return data
+            if response.status_code in _REMOTE_MEDIA_RETRYABLE_STATUS and attempt < 2:
+                await asyncio.sleep(min(1.0 * (attempt + 1), 3.0))
+                continue
+            raise HTTPException(
+                400, f"Failed to download reference_video (HTTP {response.status_code})"
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(min(1.0 * (attempt + 1), 3.0))
+                continue
+    raise HTTPException(
+        400, f"Failed to download reference_video: {last_error or 'network error'}"
+    )
+
+
 async def _load_video_bytes_from_uri(uri: Any) -> bytes:
-    maximum = 100 * 1024 * 1024
+    maximum = _MAX_REFERENCE_VIDEO_BYTES
     if hasattr(uri, "read"):
         data = await uri.read(maximum + 1)
     else:
         value = str(uri or "").strip()
-        if not value.startswith("data:video/mp4;base64,"):
-            raise HTTPException(400, "Use an MP4 upload or data:video/mp4 URI")
-        encoded = value.split(",", 1)[1]
-        if len(encoded) > 4 * ((maximum + 2) // 3):
-            raise HTTPException(400, "Video exceeds 100 MiB")
-        try:
-            data = base64.b64decode(encoded, validate=True)
-        except ValueError as exc:
-            raise HTTPException(400, "Invalid base64 video") from exc
+        if _is_remote_http_url(value):
+            data = await _download_remote_video_bytes(value)
+        else:
+            match = _VIDEO_DATA_URI_RE.match(value)
+            if not match:
+                raise HTTPException(
+                    400, "Use a video upload, data:video/(mp4|webm|quicktime) URI, or HTTPS URL"
+                )
+            encoded = match.group(2)
+            if len(encoded) > 4 * ((maximum + 2) // 3):
+                raise HTTPException(400, "Video exceeds 100 MiB")
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except ValueError as exc:
+                raise HTTPException(400, "Invalid base64 video") from exc
     if not data or len(data) > maximum:
         raise HTTPException(400, "Video is empty or exceeds 100 MiB")
-    if len(data) < 12 or data[4:8] != b"ftyp":
-        raise HTTPException(400, "Material input must be an MP4 file")
+    if not _is_valid_video_container(data):
+        raise HTTPException(400, "Material input must be an MP4, MOV, or WebM video")
     return data
 
 
@@ -1127,6 +1201,13 @@ class VideoGenerationTaskRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+def _decode_base64_image(raw: str) -> bytes:
+    try:
+        return base64.b64decode(raw, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid base64 image") from exc
+
+
 async def _extract_images_from_flexible_inputs(*raw_sources: Any) -> List[bytes]:
     images: List[bytes] = []
     for source in raw_sources:
@@ -1144,7 +1225,7 @@ async def _extract_images_from_flexible_inputs(*raw_sources: Any) -> List[bytes]
                 if uri.startswith(("data:image", "http://", "https://")) or "/tmp/" in uri:
                     images.append(await _load_image_bytes_from_uri(uri))
                 else:
-                    images.append(base64.b64decode(uri))
+                    images.append(_decode_base64_image(uri))
             elif isinstance(item, dict):
                 uri = (
                     item.get("url")
@@ -1158,7 +1239,7 @@ async def _extract_images_from_flexible_inputs(*raw_sources: Any) -> List[bytes]
                     if uri.startswith(("data:image", "http://", "https://")) or "/tmp/" in uri:
                         images.append(await _load_image_bytes_from_uri(uri))
                     else:
-                        images.append(base64.b64decode(uri))
+                        images.append(_decode_base64_image(uri))
     return images
 
 
@@ -1371,6 +1452,8 @@ async def _start_async_video_task(
     source_video: Optional[bytes] = None,
     source_start_frame: int = 0,
     source_end_frame: Optional[int] = None,
+    source_video_uri: Optional[str] = None,
+    image_inputs: Optional[List[Any]] = None,
 ) -> Task:
     handler = _ensure_generation_handler()
     task_id = f"video-{uuid.uuid4().hex}"
@@ -1403,16 +1486,27 @@ async def _start_async_video_task(
 
     async def _run_task():
         try:
+            resolved_source_video = source_video
+            if resolved_source_video is None and source_video_uri:
+                resolved_source_video = await _load_video_bytes_from_uri(source_video_uri)
+            resolved_images = list(images)
+            if image_inputs is not None:
+                resolved_images = []
+                for entry in image_inputs:
+                    if isinstance(entry, bytes):
+                        resolved_images.append(entry)
+                    elif isinstance(entry, str) and entry.strip():
+                        resolved_images.extend(await _extract_images_from_flexible_inputs(entry))
             raw_result = await _collect_non_stream_result(
                 resolved_model,
                 prompt,
-                images,
+                resolved_images,
                 first_frame=first_frame,
                 last_frame=last_frame,
                 resolution=resolution,
                 base_url_override=request_base_url,
                 video_media_id=video_media_id,
-                source_video=source_video,
+                source_video=resolved_source_video,
                 source_start_frame=source_start_frame,
                 source_end_frame=source_end_frame,
             )
@@ -1470,6 +1564,43 @@ async def _lookup_video_task(task_id: str) -> Optional[Task]:
     return task
 
 
+def _extract_raw_image_entries(*raw_sources: Any) -> tuple[List[Any], bool]:
+    entries: List[Any] = []
+    has_remote = False
+    for source in raw_sources:
+        if not source:
+            continue
+        items = source if isinstance(source, (list, tuple)) else [source]
+        for item in items:
+            if isinstance(item, (bytes, bytearray)):
+                if item:
+                    entries.append(bytes(item))
+            elif isinstance(item, str):
+                uri = item.strip()
+                if uri:
+                    if _is_remote_http_url(uri):
+                        if not _is_safe_remote_media_url(uri):
+                            raise HTTPException(400, f"Unsupported or unsafe image URL: {uri}")
+                        has_remote = True
+                    entries.append(uri)
+            elif isinstance(item, dict):
+                uri = (
+                    item.get("url")
+                    or (item.get("image_url") or {}).get("url")
+                    or item.get("b64_json")
+                    or item.get("data")
+                    or ""
+                )
+                if isinstance(uri, str) and uri.strip():
+                    clean_uri = uri.strip()
+                    if _is_remote_http_url(clean_uri):
+                        if not _is_safe_remote_media_url(clean_uri):
+                            raise HTTPException(400, f"Unsupported or unsafe image URL: {clean_uri}")
+                        has_remote = True
+                    entries.append(clean_uri)
+    return entries, has_remote
+
+
 @router.post("/v1/videos")
 @router.post("/v1/video/generations")
 @router.post("/v1/videos/generations")
@@ -1480,6 +1611,8 @@ async def create_video_generation_task(
     """Submit an asynchronous video task (supports JSON and multipart/form-data for NewAPI sora/openai_video)."""
     content_type = (raw_request.headers.get("content-type") or "").lower()
     source_video = None
+    source_video_uri = None
+    deferred_image_inputs: Optional[List[Any]] = None
     if "multipart/form-data" in content_type:
         form = await raw_request.form()
         for field in ("reference_videos", "video_url", "mask", "matte"):
@@ -1487,14 +1620,20 @@ async def create_video_generation_task(
                 raise HTTPException(400, f"{field} has no implemented wire mapping")
         if len(form.getlist("reference_video")) > 1:
             raise HTTPException(400, "reference_video must be provided once")
-        if form.get("reference_video") is not None:
-            source_video = await _load_video_bytes_from_uri(form.get("reference_video"))
+        raw_ref_video = form.get("reference_video")
+        if raw_ref_video is not None:
+            if isinstance(raw_ref_video, str) and _is_remote_http_url(raw_ref_video):
+                source_video_uri = _validate_remote_video_url(raw_ref_video)
+            else:
+                source_video = await _load_video_bytes_from_uri(raw_ref_video)
         for field in ("first_frame_image", "last_frame_image"):
             if len(form.getlist(field)) > 1:
                 raise HTTPException(400, field + " must be provided once")
         prompt = _sanitize_media_prompt(str(form.get("prompt") or ""))
         requested_model = str(form.get("model") or "omni-1.2-flash").strip()
         images: List[bytes] = []
+        raw_image_entries: List[Any] = []
+        has_remote_images = False
         first_frame = None
         last_frame = None
         for key in ("input_reference", "image", "image[]", "images", "images[]"):
@@ -1502,9 +1641,19 @@ async def create_video_generation_task(
                 if hasattr(item, "read"):
                     data = await item.read()
                     if data:
-                        images.append(data)
+                        raw_image_entries.append(data)
                 elif isinstance(item, str) and item.strip():
-                    images.extend(await _extract_images_from_flexible_inputs(item))
+                    parsed_entries, entry_remote = _extract_raw_image_entries(item)
+                    raw_image_entries.extend(parsed_entries)
+                    has_remote_images = has_remote_images or entry_remote
+        if has_remote_images:
+            deferred_image_inputs = raw_image_entries
+        else:
+            for entry in raw_image_entries:
+                if isinstance(entry, bytes):
+                    images.append(entry)
+                elif isinstance(entry, str):
+                    images.extend(await _extract_images_from_flexible_inputs(entry))
         for key in ("first_frame_image", "last_frame_image"):
             item = form.get(key)
             if hasattr(item, "read"):
@@ -1547,26 +1696,42 @@ async def create_video_generation_task(
         for field in ("reference_videos", "video_url", "mask", "matte"):
             if body.get(field) is not None:
                 raise HTTPException(400, f"{field} has no implemented wire mapping")
-        if body.get("reference_video") is not None:
-            source_video = await _load_video_bytes_from_uri(body["reference_video"])
+        raw_ref_video = body.get("reference_video")
+        if raw_ref_video is not None:
+            if isinstance(raw_ref_video, str) and _is_remote_http_url(raw_ref_video):
+                source_video_uri = _validate_remote_video_url(raw_ref_video)
+            else:
+                source_video = await _load_video_bytes_from_uri(raw_ref_video)
         prompt = _sanitize_media_prompt(req.prompt)
         requested_model = (req.model or "omni-1.2-flash").strip()
         first_frame_values = await _extract_images_from_flexible_inputs(req.first_frame_image)
         last_frame_values = await _extract_images_from_flexible_inputs(req.last_frame_image)
         first_frame = first_frame_values[0] if first_frame_values else None
         last_frame = last_frame_values[0] if last_frame_values else None
-        images = await _extract_images_from_flexible_inputs(
+        raw_image_entries, has_remote_images = _extract_raw_image_entries(
             getattr(req, "input_reference", None),
             req.image,
             req.images,
             req.image_url,
             req.reference_images,
         )
+        if has_remote_images:
+            images = []
+            deferred_image_inputs = raw_image_entries
+        else:
+            images = await _extract_images_from_flexible_inputs(
+                getattr(req, "input_reference", None),
+                req.image,
+                req.images,
+                req.image_url,
+                req.reference_images,
+            )
 
+    declared_image_count = len(deferred_image_inputs) if deferred_image_inputs is not None else len(images)
     if first_frame or last_frame:
         if not first_frame:
             raise HTTPException(status_code=400, detail="last_frame_image requires first_frame_image")
-        if images:
+        if declared_image_count:
             raise HTTPException(status_code=400, detail="frame inputs cannot be mixed with reference images")
         images = [first_frame] + ([last_frame] if last_frame else [])
         raw_seconds = (req.model_extra or {}).get("seconds", (req.model_extra or {}).get("duration"))
@@ -1576,7 +1741,8 @@ async def create_video_generation_task(
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
-    resolved_model = _resolve_request_model(requested_model, req, images=images)
+    model_resolve_images = images if deferred_image_inputs is None else [b""] * len(deferred_image_inputs)
+    resolved_model = _resolve_request_model(requested_model, req, images=model_resolve_images)
     model_cfg = MODEL_CONFIG.get(resolved_model)
     if not model_cfg or model_cfg.get("type") != "video":
         raise HTTPException(
@@ -1586,28 +1752,36 @@ async def create_video_generation_task(
     if req.video_media_id and model_cfg.get("video_type") != "extend":
         raise HTTPException(400, "video_media_id requires an explicit extend model")
     resolution = req.resolution or req.image_size
-    if source_video:
-        if not requested_model.startswith("omni-1.2-flash") or images or first_frame or last_frame:
-            raise HTTPException(400, "Video editing cannot be mixed with frame/image generation")
+    has_source_video = source_video is not None or bool(source_video_uri)
+    if has_source_video:
+        if not requested_model.startswith("omni-1.2-flash") or first_frame or last_frame:
+            raise HTTPException(400, "Video editing cannot be mixed with frame generation")
+        if declared_image_count > 3:
+            raise HTTPException(400, "Video editing supports at most 3 reference images")
         if (resolution or "").lower() != "360p":
             raise HTTPException(400, "Captured video-edit mapping requires resolution=360p")
         if req.source_end_frame is None or not 0 <= (req.source_start_frame or 0) < req.source_end_frame:
             raise HTTPException(400, "An explicit increasing source frame range is required")
     elif resolution and resolution.lower() != "720p":
         raise HTTPException(400, "Use a source video for the captured 360p edit protocol")
-    task = await _start_async_video_task(
-        resolved_model=resolved_model,
-        prompt=prompt,
-        images=images,
-        first_frame=first_frame,
-        last_frame=last_frame,
-        resolution=resolution,
-        request_base_url=_get_request_base_url(raw_request),
-        video_media_id=req.video_media_id,
-        source_video=source_video,
-        source_start_frame=req.source_start_frame or 0,
-        source_end_frame=req.source_end_frame,
-    )
+    start_kwargs: Dict[str, Any] = {
+        "resolved_model": resolved_model,
+        "prompt": prompt,
+        "images": images,
+        "first_frame": first_frame,
+        "last_frame": last_frame,
+        "resolution": resolution,
+        "request_base_url": _get_request_base_url(raw_request),
+        "video_media_id": req.video_media_id,
+        "source_video": source_video,
+        "source_start_frame": req.source_start_frame or 0,
+        "source_end_frame": req.source_end_frame,
+    }
+    if source_video_uri:
+        start_kwargs["source_video_uri"] = source_video_uri
+    if deferred_image_inputs is not None:
+        start_kwargs["image_inputs"] = deferred_image_inputs
+    task = await _start_async_video_task(**start_kwargs)
     return _format_video_task_payload(task)
 
 
@@ -1689,7 +1863,7 @@ async def get_video_generation_content(
                 )
             return FileResponse(str(local_path), media_type="video/mp4")
 
-    if file_cache and hasattr(file_cache, "download_and_cache"):
+    if file_cache and hasattr(file_cache, "download_and_cache") and not r2_storage.is_r2_storage_url(video_url):
         try:
             cached_name = await file_cache.download_and_cache(video_url, "video")
             local_path = (file_cache.cache_dir.resolve() / cached_name).resolve()
