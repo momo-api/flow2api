@@ -11325,6 +11325,17 @@ class BrowserCaptchaService:
         try:
             from nodriver import cdp
 
+            try:
+                set_bypass_csp = getattr(cdp.page, "set_bypass_csp", None)
+                if callable(set_bypass_csp):
+                    await self._run_with_timeout(
+                        tab.send(set_bypass_csp(enabled=True)),
+                        timeout_seconds=3.0,
+                        label=f"page.set_bypass_csp:{label}",
+                    )
+            except Exception:
+                pass
+
             # Runtime evaluation keeps the action guard active on the current
             # document even when CDP's new-document registration is not applied.
             await self._tab_evaluate(
