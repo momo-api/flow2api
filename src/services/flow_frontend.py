@@ -356,8 +356,14 @@ class FlowFrontendMixin:
         prompt_message = [None, None, prompt_value]
         aspect_value = self._map_frontend_video_aspect_ratio(aspect_ratio)
         metadata = self._frontend_generation_metadata(session_id)
-        resolution_value = self._frontend_video_resolution(resolution)
         normalized_mode = str(mode or "text").strip().lower()
+        # Google Flow rejects explicit resolution enum (e.g. 2 for 720p) on
+        # macaron_cookie_* (omni-1.2-flash) non-edit RPCs with code=[3].
+        resolution_value = (
+            None
+            if str(model_key or "").startswith("macaron_cookie_") and normalized_mode != "edit"
+            else self._frontend_video_resolution(resolution)
+        )
 
         if normalized_mode == "edit":
             if (not self._is_uuid(start_media_id)

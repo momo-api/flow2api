@@ -460,3 +460,24 @@ class OmniR2AndMaterialTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
                 self.assertEqual(unsafe.status_code, 400)
+
+    def test_omni_non_edit_omits_resolution_enum(self):
+        client = FlowClient(proxy_manager=None)
+        for mode, extra, expected_rpc, res_index in (
+            ("text", {}, "YhhmEf", 7),
+            ("references", {"reference_media_ids": [IMG_ID_1]}, "MZZa6b", 11),
+            ("start", {"start_media_id": IMG_ID_1}, "eb1hJf", 9),
+        ):
+            rpc_id, argument = client._build_frontend_video_generation_argument(
+                project_id=PROJECT_ID,
+                prompt="ocean wave",
+                model_key="macaron_cookie_t2v_8s" if mode == "text" else "macaron_cookie_r2v_8s",
+                aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
+                recaptcha_token="captcha-token",
+                session_id="4A038373-A788-44AF-9FA5-5C203A5FE307",
+                mode=mode,
+                resolution="720p",
+                **extra,
+            )
+            self.assertEqual(rpc_id, expected_rpc)
+            self.assertIsNone(argument[0][0][res_index])
