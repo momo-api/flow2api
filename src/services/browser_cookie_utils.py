@@ -320,6 +320,42 @@ def merge_browser_cookie_payloads(
             merge_key = _build_cookie_merge_key(normalized_item, default_url)
             if not merge_key:
                 continue
+            item_name = str(normalized_item.get("name") or "").strip()
+            item_path = str(normalized_item.get("path") or "/").strip() or "/"
+            explicit_domain = str(normalized_item.get("domain") or "").strip().lower()
+            if explicit_domain:
+                bare_domain = explicit_domain.lstrip(".")
+                for existing_key in list(merged.keys()):
+                    existing_item = merged[existing_key]
+                    if existing_item.get("domain"):
+                        continue
+                    if (
+                        str(existing_item.get("name") or "").strip() != item_name
+                        or (str(existing_item.get("path") or "/").strip() or "/") != item_path
+                    ):
+                        continue
+                    existing_host = str(
+                        urlparse(str(existing_item.get("url") or default_url)).hostname or ""
+                    ).strip().lower()
+                    if existing_host == bare_domain or existing_host.endswith(f".{bare_domain}"):
+                        merged.pop(existing_key, None)
+            else:
+                item_host = str(
+                    urlparse(str(normalized_item.get("url") or default_url)).hostname or ""
+                ).strip().lower()
+                if any(
+                    existing_item.get("domain")
+                    and str(existing_item.get("name") or "").strip() == item_name
+                    and (str(existing_item.get("path") or "/").strip() or "/") == item_path
+                    and (
+                        item_host == str(existing_item["domain"]).strip().lower().lstrip(".")
+                        or item_host.endswith(
+                            "." + str(existing_item["domain"]).strip().lower().lstrip(".")
+                        )
+                    )
+                    for existing_item in merged.values()
+                ):
+                    continue
             merged[merge_key] = normalized_item
 
     append_cookie_items(base_cookie)

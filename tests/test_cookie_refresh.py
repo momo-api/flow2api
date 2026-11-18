@@ -1040,6 +1040,49 @@ class BrowserCookieRefreshTests(unittest.IsolatedAsyncioTestCase):
         )
         lock.release()
 
+    async def test_protocol_login_hits_rotate_cookies_page_first(self):
+        jar = _cookie_jar(NEW_COOKIES)
+        lines = [
+            (
+                ("#HttpOnly_" if c.has_nonstandard_attr("HttpOnly") else "")
+                + CurlMorsel.from_cookiejar_cookie(c).to_curl_format()
+            ).encode()
+            for c in jar
+        ]
+        rotate_resp = types.SimpleNamespace(text="ok", url="https://accounts.google.com/RotateCookiesPage", status_code=200, infos={})
+        flow_resp = types.SimpleNamespace(
+            text=PAGE, url="https://flow.google.com/projects", status_code=200, infos={CurlInfo.COOKIELIST: lines}
+        )
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        session.get = AsyncMock(side_effect=[rotate_resp, flow_resp])
+        with patch("src.services.protocol_login.AsyncSession", return_value=session):
+            result = await ProtocolLogin().login(COOKIES, email=EMAIL)
+        self.assertTrue(result["success"])
+        self.assertEqual(session.get.await_count, 2)
+        self.assertIn("accounts.google.com/RotateCookiesPage", session.get.call_args_list[0].args[0])
+        self.assertIn("flow.google.com/projects", session.get.call_args_list[1].args[0])
+
+    def test_merge_evicts_url_only_duplicates_when_domain_cookie_present(self):
+        from src.services.browser_cookie_utils import merge_browser_cookie_payloads
+
+        stale_url_only = json.dumps([
+            {"name": "SIDCC", "value": "stale-1", "url": "https://flow.google.com/", "path": "/", "secure": True},
+            {"name": "SIDCC", "value": "stale-2", "url": "https://labs.google/", "path": "/", "secure": True},
+            {"name": "OSID", "value": "keep-host", "domain": "flow.google.com", "hostOnly": True, "path": "/", "secure": True},
+        ])
+        fresh_domain = [
+            {"name": "SIDCC", "value": "fresh-sidcc", "domain": ".google.com", "path": "/", "secure": True},
+        ]
+        merged = json.loads(merge_browser_cookie_payloads(stale_url_only, fresh_domain))
+        sidcc_items = [c for c in merged if c["name"] == "SIDCC"]
+        self.assertEqual(len(sidcc_items), 2)  # .google.com + labs.google (not google.com!)
+        self.assertEqual(
+            [c["value"] for c in sidcc_items if c.get("domain") == ".google.com"],
+            ["fresh-sidcc"],
+        )
+        self.assertFalse(any(c.get("url") == "https://flow.google.com/" for c in sidcc_items))
+
 
 if __name__ == "__main__":
     unittest.main()
