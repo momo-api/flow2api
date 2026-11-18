@@ -21,7 +21,6 @@ from .browser_cookie_utils import (
 
 
 FLOW_BASE = "https://flow.google.com"
-ROTATE_COOKIES_PAGE_URL = "https://accounts.google.com/RotateCookiesPage?og_pid=749&rot=3&origin=https%3A%2F%2Fflow.google.com&exp_id=0"
 IMPERSONATE = "chrome"
 
 
@@ -158,17 +157,6 @@ class ProtocolLogin:
 
         try:
             async with AsyncSession(**session_kwargs) as session:
-                try:
-                    await session.get(
-                        ROTATE_COOKIES_PAGE_URL,
-                        headers={
-                            "Referer": f"{FLOW_BASE}/",
-                        },
-                    )
-                except Exception as rotate_exc:
-                    debug_logger.log_warning(
-                        f"[PROTOCOL_LOGIN] RotateCookiesPage 预刷新失败（忽略并继续校验）: {rotate_exc}"
-                    )
                 response = await session.get(
                     f"{FLOW_BASE}/projects",
                     headers={
