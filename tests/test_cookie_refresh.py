@@ -1060,6 +1060,33 @@ class BrowserCookieRefreshTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(any(c.get("url") == "https://flow.google.com/" for c in sidcc_items))
 
+    async def test_preserve_profile_cookies_skips_cdp_injection(self):
+        backend = PersonalService.__new__(PersonalService)
+        backend._load_token_cookie = AsyncMock(return_value=COOKIES)
+        backend._set_browser_cookie_targets = AsyncMock()
+        backend._remember_token_affinity = MagicMock()
+        resident = types.SimpleNamespace(
+            slot_id="slot-1",
+            tab=MagicMock(),
+            token_id=None,
+            cookie_signature=None,
+            session_cookies="old",
+            session_cookies_fetched_at=1.0,
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "PERSONAL_BROWSER_USER_DATA_DIR": "/app/data/manual-flow-login",
+                "PERSONAL_BROWSER_PRESERVE_PROFILE_COOKIES": "1",
+            },
+        ):
+            ok = await backend._apply_token_cookie_binding(
+                resident, 1, label="test_preserve"
+            )
+        self.assertTrue(ok)
+        self.assertEqual(resident.token_id, 1)
+        backend._set_browser_cookie_targets.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

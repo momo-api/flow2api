@@ -7722,6 +7722,22 @@ class BrowserCaptchaService:
         ):
             return True
 
+        if (
+            os.environ.get("PERSONAL_BROWSER_USER_DATA_DIR", "").strip()
+            and _env_truthy("PERSONAL_BROWSER_PRESERVE_PROFILE_COOKIES")
+        ):
+            resident_info.token_id = int(token_key)
+            resident_info.cookie_signature = cookie_signature
+            resident_info.session_cookies = None
+            resident_info.session_cookies_fetched_at = 0.0
+            self._remember_token_affinity(
+                int(token_key), resident_info.slot_id, resident_info
+            )
+            debug_logger.log_info(
+                f"[BrowserCaptcha] 复用持久化 profile 原生登录态，跳过 CDP Cookie 注入 (slot={resident_info.slot_id}, token_id={token_key})"
+            )
+            return True
+
         browser_cookies = self._build_personal_cookie_targets(cookie_text)
         if not browser_cookies:
             return False
