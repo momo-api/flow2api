@@ -345,3 +345,142 @@ class PersonalIsolatedContextsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cached_after, {"SID": "stale-token1-sid"})
         # Solve bundle bound to token_id=2 with no slot_id must NOT grab Token #1 global cache
         self.assertIsNone(bundle["session_cookies"])
+
+    def test_build_personal_cookie_targets_preserves_scope_without_cross_domain_mirroring(self):
+        raw = json.dumps(
+            [
+                {
+                    "name": "SID",
+                    "value": "sid-1",
+                    "domain": ".google.com",
+                    "path": "/",
+                    "secure": False,
+                    "httpOnly": False,
+                    "sameSite": "lax",
+                },
+                {
+                    "name": "OSID",
+                    "value": "osid-1",
+                    "domain": "flow.google.com",
+                    "hostOnly": True,
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                },
+                {
+                    "name": "LSID",
+                    "value": "lsid-1",
+                    "domain": "accounts.google.com",
+                    "hostOnly": True,
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                },
+                {
+                    "name": "__Host-1PLSID",
+                    "value": "h1p-1",
+                    "domain": "accounts.google.com",
+                    "hostOnly": True,
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                },
+            ]
+        )
+        targets = BrowserCaptchaService._build_personal_cookie_targets(raw)
+        self.assertEqual(len(targets), 4)
+        for item in targets:
+            host = BrowserCaptchaService._extract_cookie_scope_host(item)
+            self.assertNotIn("recaptcha.net", host)
+            self.assertNotEqual(host, "www.google.com")
+
+        by_name = {item["name"]: item for item in targets}
+        self.assertEqual(by_name["SID"].get("domain"), ".google.com")
+        self.assertEqual(by_name["SID"].get("sameSite"), "Lax")
+        self.assertEqual(by_name["OSID"].get("url"), "https://flow.google.com/")
+        self.assertEqual(by_name["LSID"].get("url"), "https://accounts.google.com/")
+        self.assertEqual(by_name["__Host-1PLSID"].get("url"), "https://accounts.google.com/")
+
+    def test_build_personal_cookie_targets_filters_legacy_poisoned_www_copies(self):
+        raw = json.dumps(
+            [
+                {"name": "SID", "value": "s1", "domain": ".google.com", "path": "/", "secure": True},
+                {"name": "OSID", "value": "o1", "domain": "flow.google.com", "hostOnly": True, "path": "/", "secure": True},
+                {"name": "LSID", "value": "l1", "domain": "accounts.google.com", "hostOnly": True, "path": "/", "secure": True},
+                {"name": "UULE", "value": "u1", "domain": "www.google.com", "hostOnly": True, "path": "/", "secure": True},
+                {"name": "OSID", "value": "o-bad", "domain": "www.google.com", "hostOnly": True, "path": "/", "secure": True},
+                {"name": "LSID", "value": "l-bad", "url": "https://www.google.com/", "path": "/", "secure": True},
+                {"name": "SID", "value": "r-bad", "url": "https://www.recaptcha.net/", "path": "/", "secure": True},
+                {"name": "__Secure-1PSID", "value": "r2-bad", "domain": ".recaptcha.net", "path": "/", "secure": True},
+            ]
+        )
+        targets = BrowserCaptchaService._build_personal_cookie_targets(raw)
+        pairs = {
+            (item["name"], BrowserCaptchaService._extract_cookie_scope_host(item))
+            for item in targets
+        }
+        self.assertEqual(
+            pairs,
+            {
+                ("SID", "google.com"),
+                ("OSID", "flow.google.com"),
+                ("LSID", "accounts.google.com"),
+                ("UULE", "www.google.com"),
+            },
+        )
+
+    def test_build_personal_cookie_targets_routes_flat_header_to_real_domains(self):
+        flat = "OSID=osid-v; __Secure-OSID=sosid-v; LSID=lsid-v; __Host-1PLSID=h1p-v; SID=sid-v"
+        targets = BrowserCaptchaService._build_personal_cookie_targets(flat)
+        self.assertEqual(len(targets), 5)
+        by_name = {item["name"]: item for item in targets}
+        self.assertEqual(by_name["OSID"].get("url"), "https://flow.google.com/")
+        self.assertEqual(by_name["__Secure-OSID"].get("url"), "https://flow.google.com/")
+        self.assertEqual(by_name["LSID"].get("url"), "https://accounts.google.com/")
+        self.assertEqual(by_name["__Host-1PLSID"].get("url"), "https://accounts.google.com/")
+        self.assertEqual(by_name["SID"].get("domain"), ".google.com")
+        for item in targets:
+            host = BrowserCaptchaService._extract_cookie_scope_host(item)
+            self.assertNotIn("recaptcha.net", host)
+            self.assertNotEqual(host, "www.google.com")
+
+    async def test_persist_context_cookies_strips_cross_host_auth_duplicates(self):
+        service = BrowserCaptchaService()
+        service.headless = False
+        service.db = types.SimpleNamespace(update_token=AsyncMock())
+        service._load_token_cookie = AsyncMock(return_value="[]")
+        service._get_browser_cookies = AsyncMock(
+            return_value=[
+                {"name": "SID", "value": "s1", "domain": ".google.com", "path": "/", "secure": True},
+                {"name": "OSID", "value": "o1", "domain": "flow.google.com", "path": "/", "secure": True},
+                {"name": "LSID", "value": "l1", "domain": "accounts.google.com", "path": "/", "secure": True},
+                {"name": "OSID", "value": "o-bad", "domain": "www.google.com", "path": "/", "secure": True},
+                {"name": "LSID", "value": "l-bad", "domain": "www.google.com", "path": "/", "secure": True},
+                {"name": "SID", "value": "r-bad", "domain": ".recaptcha.net", "path": "/", "secure": True},
+            ]
+        )
+        resident = ResidentTabInfo(
+            tab=_make_fake_tab(),
+            slot_id="slot-1",
+            token_id=1,
+            browser_context_id="ctx-1",
+        )
+
+        persisted = await service._persist_context_cookies_to_token(
+            resident, 1, label="strip_test"
+        )
+        self.assertTrue(persisted)
+        service.db.update_token.assert_awaited_once()
+        saved = json.loads(service.db.update_token.await_args.kwargs["google_cookies"])
+        pairs = {
+            (item["name"], BrowserCaptchaService._extract_cookie_scope_host(item))
+            for item in saved
+        }
+        self.assertEqual(
+            pairs,
+            {
+                ("SID", "google.com"),
+                ("OSID", "flow.google.com"),
+                ("LSID", "accounts.google.com"),
+            },
+        )

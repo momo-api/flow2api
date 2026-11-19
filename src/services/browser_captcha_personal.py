@@ -44,6 +44,7 @@ from .browser_cookie_utils import (
     is_partitioned_cookie,
     merge_browser_cookie_payloads,
     normalize_cookie_storage_text,
+    parse_browser_cookie_payload,
 )
 
 # flow2api 缺少的配置常量和函数，内联定义
@@ -85,6 +86,17 @@ PERSONAL_COOKIE_TARGET_URLS = (
 PERSONAL_GOOGLE_FAMILY_COOKIE_MIRROR_URLS = (
     "https://www.google.com/",
     "https://www.recaptcha.net/",
+)
+_FLOW_HOST_ONLY_COOKIES = frozenset({"OSID", "__Secure-OSID"})
+_ACCOUNTS_HOST_ONLY_COOKIES = frozenset(
+    {
+        "LSID",
+        "__Host-1PLSID",
+        "__Host-3PLSID",
+        "__Host-GAPS",
+        "ACCOUNT_CHOOSER",
+        "SMSV",
+    }
 )
 # Session cookie cache for computed captcha relay
 # Personal browser writes Google session cookies here after each successful solve.
@@ -6969,29 +6981,33 @@ class BrowserCaptchaService:
         )
 
     @classmethod
+    def _is_poisoned_personal_cookie(cls, cookie: Dict[str, Any]) -> bool:
+        """Detect cross-host auth or recaptcha.net cookie copies that revoke Google sessions."""
+        scope_host = cls._extract_cookie_scope_host(cookie)
+        if scope_host == "recaptcha.net" or scope_host.endswith(".recaptcha.net"):
+            return True
+        name = str(cookie.get("name") or "").strip()
+        if scope_host == "www.google.com" and (
+            name in _FLOW_HOST_ONLY_COOKIES or name in _ACCOUNTS_HOST_ONLY_COOKIES
+        ):
+            return True
+        return False
+
+    @classmethod
     def _build_personal_cookie_targets(
         cls, raw_cookie: Optional[str]
     ) -> list[Dict[str, Any]]:
-        """为 personal 内置浏览器构建 cookie 注入列表。
-
-        说明：
-        - 原始 Cookie 头没有 domain 元数据时，直接扩展到 labs/google/recaptcha 三个目标。
-        - 即使 token.google_cookies 已经带有显式的 google.com 域，也额外镜像一份到
-          `www.recaptcha.net`，保证 enterprise reload 首轮请求也能命中 cookie。
-        - 对 Google/reCAPTCHA Cookie 强制使用 `SameSite=None`
-          场景下第三方 anchor/reload 请求继续丢 cookie。
-        """
-        browser_cookies = build_browser_cookie_targets(
-            raw_cookie,
-            fallback_urls=list(PERSONAL_COOKIE_TARGET_URLS),
-        )
-        if not browser_cookies:
+        """Build scoped CDP cookie targets without cross-domain auth mirroring."""
+        normalized = normalize_cookie_storage_text(raw_cookie)
+        if not normalized:
             return []
 
         expanded: list[Dict[str, Any]] = []
         seen: set[str] = set()
 
         def append_cookie(cookie: Dict[str, Any]) -> None:
+            if cls._is_poisoned_personal_cookie(cookie):
+                return
             stable_key = json.dumps(
                 cookie, ensure_ascii=True, sort_keys=True, separators=(",", ":")
             )
@@ -7000,29 +7016,61 @@ class BrowserCaptchaService:
             seen.add(stable_key)
             expanded.append(cookie)
 
-        for cookie in browser_cookies:
-            scope_host = cls._extract_cookie_scope_host(cookie)
-            explicit_domain = str(cookie.get("domain") or "").strip()
-            google_family_scope = cls._is_google_family_cookie_host(scope_host)
+        is_structured_json = False
+        if normalized[:1] in {"[", "{"}:
+            try:
+                parsed_json = json.loads(normalized)
+                if isinstance(parsed_json, (list, dict)):
+                    is_structured_json = True
+            except Exception:
+                is_structured_json = False
 
-            if explicit_domain or str(cookie.get("url") or "").strip() or not google_family_scope:
-                append_cookie(cookie)
-
-            if not google_family_scope:
-                continue
-
-            mirrored_cookie = dict(cookie)
-            mirrored_cookie.pop("domain", None)
-            mirrored_cookie["path"] = (
-                str(mirrored_cookie.get("path") or "/").strip() or "/"
+        if is_structured_json:
+            browser_cookies = build_browser_cookie_targets(
+                normalized,
+                fallback_urls=["https://flow.google.com/"],
             )
-            mirrored_cookie["sameSite"] = "None"
-            mirrored_cookie["secure"] = True
-            for target_url in PERSONAL_GOOGLE_FAMILY_COOKIE_MIRROR_URLS:
+            for cookie in browser_cookies:
+                append_cookie(cookie)
+            return expanded
+
+        parsed_cookies = parse_browser_cookie_payload(
+            normalized,
+            default_url="https://flow.google.com/",
+        )
+        for cookie in parsed_cookies:
+            name = str(cookie.get("name") or "").strip()
+            value = str(cookie.get("value") or "")
+            if not name:
+                continue
+            if name in _FLOW_HOST_ONLY_COOKIES:
                 append_cookie(
                     {
-                    **mirrored_cookie,
-                    "url": target_url,
+                        "name": name,
+                        "value": value,
+                        "url": "https://flow.google.com/",
+                        "path": "/",
+                        "secure": True,
+                    }
+                )
+            elif name in _ACCOUNTS_HOST_ONLY_COOKIES:
+                append_cookie(
+                    {
+                        "name": name,
+                        "value": value,
+                        "url": "https://accounts.google.com/",
+                        "path": "/",
+                        "secure": True,
+                    }
+                )
+            else:
+                append_cookie(
+                    {
+                        "name": name,
+                        "value": value,
+                        "domain": ".google.com",
+                        "path": "/",
+                        "secure": True,
                     }
                 )
 
@@ -7706,6 +7754,7 @@ class BrowserCaptchaService:
                     for cookie in (current_cookies or [])
                 )
                 if normalized_cookie
+                and not self._is_poisoned_personal_cookie(normalized_cookie)
             ]
             if not serialized_cookies:
                 return False
