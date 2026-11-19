@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import math
 import time
@@ -1729,6 +1730,7 @@ class GenerationHandler:
 
         # 2. 选择Token（账号配额耗尽时自动切换到其他账号重试）
         failed_token_ids: set = set()
+        auth_refreshed_token_ids: set = set()
         last_failover_error: Optional[str] = None
         failover_summary: List[str] = []
         risk_failures = 0
@@ -2067,6 +2069,32 @@ class GenerationHandler:
             except Exception as e:
                 error_msg = f"生成失败: {str(e)}"
                 debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
+                if (
+                    token
+                    and self._is_flow_auth_401_error(e)
+                    and token.id not in auth_refreshed_token_ids
+                    and token_attempt < MAX_TOKEN_FAILOVER_ATTEMPTS - 1
+                    and not getattr(e, "submission_uncertain", False)
+                    and not getattr(e, "outcome_unknown", False)
+                ):
+                    auth_refreshed_token_ids.add(token.id)
+                    if await self._try_refresh_cookies_after_401(token.id):
+                        perf_trace.setdefault("token_failovers", []).append(
+                            {
+                                "token_id": token.id,
+                                "error": str(e)[:200],
+                                "action": "cookie_refresh",
+                            }
+                        )
+                        debug_logger.log_warning(
+                            f"[GENERATION] Token {token.id} 遇到 Flow 401，已刷新 Cookie 并同号重试 "
+                            f"({token_attempt + 2}/{MAX_TOKEN_FAILOVER_ATTEMPTS})"
+                        )
+                        if stream:
+                            yield self._create_stream_chunk(
+                                "检测到登录态失效，已刷新 Cookie 并重试...\n"
+                            )
+                        continue
                 is_quota_error = self._is_quota_exhausted_error(e)
                 if (
                     token
@@ -2164,6 +2192,28 @@ class GenerationHandler:
     def _is_quota_exhausted_error(error: Exception) -> bool:
         """账号配额耗尽：换一个账号通常可以成功。"""
         return "public_error_user_quota_reached" in str(error or "").lower()
+
+    @staticmethod
+    def _is_flow_auth_401_error(error: Exception) -> bool:
+        """Flow 前端批处理返回 401 时，通常是打码/后台期间 Google Cookie 被轮换。"""
+        text = str(error or "").lower()
+        return "code=401" in text or "flow 登录认证失败" in text
+
+    async def _try_refresh_cookies_after_401(self, token_id: int) -> bool:
+        """在遇到 Flow 401 时尝试主动刷新一次该账号的 Google Cookies。"""
+        refresh_fn = getattr(self.token_manager, "refresh_cookies", None)
+        if not callable(refresh_fn):
+            return False
+        try:
+            refresh_call = refresh_fn(token_id)
+            if not inspect.isawaitable(refresh_call):
+                return False
+            return bool(await asyncio.wait_for(refresh_call, timeout=35))
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[GENERATION] Token {token_id} 遇到 Flow 401，刷新 Cookie 失败: {str(e)[:200]}"
+            )
+            return False
 
     async def _refresh_token_credits(self, token) -> Optional[int]:
         """配额耗尽后刷新并落库余额，作为冷却解除的基准；失败时退回已知余额。"""
