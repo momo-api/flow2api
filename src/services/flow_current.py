@@ -64,6 +64,27 @@ class CurrentFlowClientMixin:
             token_id=token_id,
         )
 
+    async def _reload_latest_google_cookies(
+        self,
+        google_cookies: Optional[str] = None,
+        token_id: Optional[int] = None,
+    ) -> Optional[str]:
+        """Reload latest DB google_cookies after browser captcha steps may rotate them."""
+        if token_id is None:
+            return google_cookies
+        db = getattr(self, "db", None)
+        if db is None:
+            return google_cookies
+        try:
+            latest_token = await db.get_token(int(token_id))
+        except Exception as exc:
+            debug_logger.log_warning(
+                f"[COOKIES] 重新读取 Token {token_id} 最新 Google Cookies 失败，沿用当前快照: {exc}"
+            )
+            return google_cookies
+        latest_cookies = str(getattr(latest_token, "google_cookies", "") or "").strip()
+        return latest_cookies or google_cookies
+
     @staticmethod
     def _normalize_media_name(media_name: str) -> str:
         normalized = str(media_name or "").strip().rstrip("/")
@@ -641,6 +662,9 @@ class CurrentFlowClientMixin:
                 attempt["recaptcha_ok"] = bool(token)
                 if not token:
                     raise RuntimeError("Failed to obtain reCAPTCHA token")
+                active_google_cookies = await self._reload_latest_google_cookies(
+                    google_cookies, token_id
+                )
                 if progress_callback:
                     await progress_callback("submitting_image", 48)
                 session_id = str(uuid.uuid4()).upper()
@@ -655,7 +679,7 @@ class CurrentFlowClientMixin:
                         session_id=session_id,
                         image_inputs=image_inputs,
                     ),
-                    google_cookies=google_cookies,
+                    google_cookies=active_google_cookies,
                     token_id=token_id,
                     project_id=project_id,
                     timeout=max(
@@ -727,6 +751,9 @@ class CurrentFlowClientMixin:
         if not token:
             raise RuntimeError("Failed to obtain reCAPTCHA token for image upsample")
         try:
+            active_google_cookies = await self._reload_latest_google_cookies(
+                google_cookies, token_id
+            )
             # The page sends enum values (verified by capturing the real UI request):
             # 1 = 2K, 2 = 4K.
             resolution = 2 if "4K" in str(target_resolution).upper() else 1
@@ -737,7 +764,7 @@ class CurrentFlowClientMixin:
                     resolution,
                     self._frontend_project_context(project_id, token),
                 ],
-                google_cookies=google_cookies,
+                google_cookies=active_google_cookies,
                 token_id=token_id,
                 project_id=project_id,
                 timeout=max(
@@ -791,6 +818,9 @@ class CurrentFlowClientMixin:
                 )
                 if not token:
                     raise RuntimeError("Failed to obtain reCAPTCHA token")
+                active_google_cookies = await self._reload_latest_google_cookies(
+                    google_cookies, token_id
+                )
                 rpc_id, argument = self._build_frontend_video_generation_argument(
                     project_id=project_id,
                     prompt=prompt,
@@ -812,7 +842,7 @@ class CurrentFlowClientMixin:
                 payload = await self._current_rpc(
                     rpc_id=rpc_id,
                     argument=argument,
-                    google_cookies=google_cookies,
+                    google_cookies=active_google_cookies,
                     token_id=token_id,
                     project_id=project_id,
                     timeout=max(self._get_video_submit_timeout(), 90),
