@@ -41,6 +41,16 @@ def _clamp_ttl_seconds(raw: Any) -> int:
     return max(MIN_R2_VIDEO_TTL_SECONDS, min(parsed, MAX_R2_VIDEO_TTL_SECONDS))
 
 
+def _clean_gateway_base_url(raw: str) -> str:
+    value = str(raw or "").strip().rstrip("/")
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+
+
 def get_r2_video_config() -> Optional[Dict[str, Any]]:
     """Read R2 S3 configuration from environment variables, or return None if incomplete."""
     access_key_id = _clean_env("R2_ACCESS_KEY_ID")
@@ -61,6 +71,9 @@ def get_r2_video_config() -> Optional[Dict[str, Any]]:
     ttl_seconds = _clamp_ttl_seconds(
         _clean_env("R2_VIDEO_URL_TTL_SECONDS", str(DEFAULT_R2_VIDEO_TTL_SECONDS))
     )
+    gateway_base_url = _clean_gateway_base_url(_clean_env("R2_MEDIA_GATEWAY_BASE_URL"))
+    gateway_signing_secret = _clean_env("R2_MEDIA_SIGNING_SECRET")
+    gateway_host = (urlparse(gateway_base_url).hostname or "").lower() if (gateway_base_url and gateway_signing_secret) else ""
     return {
         "endpoint": f"https://{parsed.netloc}",
         "host": parsed.netloc,
@@ -69,6 +82,9 @@ def get_r2_video_config() -> Optional[Dict[str, Any]]:
         "bucket": bucket,
         "prefix": prefix,
         "ttl_seconds": ttl_seconds,
+        "gateway_base_url": gateway_base_url if gateway_host else "",
+        "gateway_host": gateway_host,
+        "gateway_signing_secret": gateway_signing_secret if gateway_host else "",
     }
 
 
@@ -79,11 +95,13 @@ def is_r2_video_storage_configured() -> bool:
 def is_r2_storage_url(url: str) -> bool:
     parsed = urlparse(str(url or "").strip())
     hostname = (parsed.hostname or "").lower()
-    return (
-        parsed.scheme == "https"
-        and hostname.endswith(".r2.cloudflarestorage.com")
-        and not any(c in hostname for c in "\\\r\n")
-    )
+    if parsed.scheme != "https" or not hostname or any(c in hostname for c in "\\\r\n"):
+        return False
+    if hostname.endswith(".r2.cloudflarestorage.com") or hostname == "media.momoapi.us":
+        return True
+    gateway_base = _clean_gateway_base_url(_clean_env("R2_MEDIA_GATEWAY_BASE_URL"))
+    gateway_host = (urlparse(gateway_base).hostname or "").lower() if gateway_base else ""
+    return bool(gateway_host and hostname == gateway_host)
 
 
 def _hmac_sha256(key: bytes, msg: str) -> bytes:
@@ -105,6 +123,34 @@ def _encode_s3_path(bucket: str, object_key: str) -> str:
     return f"/{quote(bucket, safe='-_.~')}/{joined}"
 
 
+def _encode_object_path(object_key: str) -> str:
+    safe_parts = [p for p in str(object_key or "").strip("/").split("/") if p and p not in {".", ".."}]
+    if not safe_parts or any("\\" in p for p in safe_parts):
+        raise ValueError("Invalid R2 object key")
+    return "/" + "/".join(quote(part, safe="-_.~") for part in safe_parts)
+
+
+def build_gateway_get_url(
+    base_url: str,
+    signing_secret: str,
+    object_key: str,
+    *,
+    expires_in: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> str:
+    """Create a Worker media-gateway HMAC-SHA256 signed GET URL."""
+    clean_base = _clean_gateway_base_url(base_url)
+    if not clean_base or not signing_secret:
+        raise ValueError("Invalid media gateway configuration")
+    moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    ttl = _clamp_ttl_seconds(expires_in if expires_in is not None else DEFAULT_R2_VIDEO_TTL_SECONDS)
+    exp = int(moment.timestamp()) + ttl
+    encoded_path = _encode_object_path(object_key)
+    canonical = f"GET\n{encoded_path}\n{exp}"
+    sig = hmac.new(signing_secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{clean_base}{encoded_path}?exp={exp}&sig={sig}"
+
+
 def build_presigned_get_url(
     config_dict: Dict[str, Any],
     object_key: str,
@@ -112,11 +158,21 @@ def build_presigned_get_url(
     expires_in: Optional[int] = None,
     now: Optional[datetime] = None,
 ) -> str:
-    """Create a Cloudflare R2 SigV4 presigned GET URL valid for up to 24 hours."""
+    """Create a media-gateway signed GET URL when enabled, else a Cloudflare R2 SigV4 URL."""
+    gateway_base_url = str(config_dict.get("gateway_base_url") or "").strip()
+    gateway_signing_secret = str(config_dict.get("gateway_signing_secret") or "").strip()
+    ttl = _clamp_ttl_seconds(expires_in if expires_in is not None else config_dict["ttl_seconds"])
+    if gateway_base_url and gateway_signing_secret:
+        return build_gateway_get_url(
+            gateway_base_url,
+            gateway_signing_secret,
+            object_key,
+            expires_in=ttl,
+            now=now,
+        )
     moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     amz_date = moment.strftime("%Y%m%dT%H%M%SZ")
     date_stamp = moment.strftime("%Y%m%d")
-    ttl = _clamp_ttl_seconds(expires_in if expires_in is not None else config_dict["ttl_seconds"])
     credential_scope = f"{date_stamp}/auto/s3/aws4_request"
     canonical_uri = _encode_s3_path(config_dict["bucket"], object_key)
     query_items = [
