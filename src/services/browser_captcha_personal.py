@@ -1650,6 +1650,7 @@ class BrowserCaptchaService:
         self.user_data_dir = self._resolve_user_data_dir(self.headless)
         self._visible_startup_target_id: Optional[str] = None
         self._headless_host_target_id: Optional[str] = None
+        self._isolated_browser_context_ids: set[str] = set()
         self._runtime_fingerprint_spoof_seed = ""
         self._runtime_surface_profile: Dict[str, Any] = {}
         self._refresh_runtime_fingerprint_spoof_seed()
@@ -1745,6 +1746,31 @@ class BrowserCaptchaService:
         self._custom_tabs: dict[str, Dict[str, Any]] = {}
         self._custom_lock = asyncio.Lock()
         self._refresh_runtime_tunables()
+
+    def _use_isolated_browser_contexts(self) -> bool:
+        """Whether each account/slot should use an isolated CDP BrowserContext."""
+        if bool(getattr(self, "headless", False)):
+            return True
+        return _env_truthy("PERSONAL_BROWSER_ISOLATED_CONTEXTS")
+
+    def _get_isolated_browser_context_ids(self) -> set[str]:
+        """Return the set tracking active isolated BrowserContext IDs."""
+        ids = getattr(self, "_isolated_browser_context_ids", None)
+        if ids is None:
+            ids = set()
+            self._isolated_browser_context_ids = ids
+        return ids
+
+    @staticmethod
+    def _normalize_browser_context_id(browser_context_id: Any) -> Any:
+        """Convert plain-string context IDs into nodriver BrowserContextID objects."""
+        if browser_context_id is None:
+            return None
+        if hasattr(browser_context_id, "to_json"):
+            return browser_context_id
+        from nodriver import cdp
+
+        return cdp.browser.BrowserContextID(str(browser_context_id))
 
     def _apply_browser_instance_identity(self, browser_instance_id: int) -> None:
         normalized_instance_id = max(0, int(browser_instance_id or 0))
@@ -6395,12 +6421,12 @@ class BrowserCaptchaService:
 
         for item in getattr(browser, "targets", []):
             if getattr(item, "type_", None) == "page":
-                if (
-                    self.headless
-                    and getattr(
-                        getattr(item, "target", None), "browser_context_id", None
-                    )
-                    is not None
+                target_context_id = getattr(
+                    getattr(item, "target", None), "browser_context_id", None
+                )
+                if (self.headless and target_context_id is not None) or (
+                    target_context_id is not None
+                    and str(target_context_id) in self._get_isolated_browser_context_ids()
                 ):
                     continue
                 if self.headless:
@@ -6635,7 +6661,7 @@ class BrowserCaptchaService:
             if target_url.lower() != PERSONAL_COOKIE_PREBIND_URL
             else target_url
         )
-        if not self.headless:
+        if not self._use_isolated_browser_contexts():
             # 有头模式下不再为内部打码页创建独立可见 browser context 窗口。
             # 直接复用默认 context 的单一浏览器窗口，通过新标签页承载 resident/legacy 页面。
             tab = await self._open_visible_browser_tab(
@@ -6662,15 +6688,18 @@ class BrowserCaptchaService:
                     f"[BrowserCaptcha] 创建独立 context 前补宿主页失败 ({label}): {e}"
                 )
 
-        browser_context_id = await self._run_with_timeout(
-            browser.send(
-                cdp.target.create_browser_context(
-                    dispose_on_detach=True,
-                )
-            ),
-            timeout_seconds=timeout_seconds,
-            label=f"{label}:create_browser_context",
+        browser_context_id = self._normalize_browser_context_id(
+            await self._run_with_timeout(
+                browser.send(
+                    cdp.target.create_browser_context(
+                        dispose_on_detach=True,
+                    )
+                ),
+                timeout_seconds=timeout_seconds,
+                label=f"{label}:create_browser_context",
+            )
         )
+        self._get_isolated_browser_context_ids().add(str(browser_context_id))
         target_id = None
 
         try:
@@ -6758,19 +6787,34 @@ class BrowserCaptchaService:
         label: str,
         timeout_seconds: Optional[float] = None,
         browser_context_id: Any = None,
+        fallback_to_global: Optional[bool] = None,
     ):
         if browser_context_id is not None and self.browser:
+            allow_fallback = (
+                (not self._use_isolated_browser_contexts())
+                if fallback_to_global is None
+                else bool(fallback_to_global)
+            )
             try:
                 from nodriver import cdp
 
                 return await self._run_with_timeout(
                     self.browser.send(
-                        cdp.storage.get_cookies(browser_context_id=browser_context_id)
+                        cdp.storage.get_cookies(
+                            browser_context_id=self._normalize_browser_context_id(
+                                browser_context_id
+                            )
+                        )
                     ),
                     timeout_seconds or self._command_timeout_seconds,
                     label,
                 )
             except Exception as e:
+                if not allow_fallback:
+                    debug_logger.log_warning(
+                        f"[BrowserCaptcha] 按 context 读取 cookies 失败 ({label}): {e}"
+                    )
+                    raise
                 debug_logger.log_warning(
                     f"[BrowserCaptcha] 按 context 读取 cookies 失败，回退全局 cookie jar ({label}): {e}"
                 )
@@ -7337,6 +7381,8 @@ class BrowserCaptchaService:
     async def _dispose_browser_context_quietly(
         self, browser_context_id: Any, browser_instance=None
     ):
+        if browser_context_id is not None:
+            self._get_isolated_browser_context_ids().discard(str(browser_context_id))
         target_browser = browser_instance or self.browser
         if browser_context_id is None or not target_browser:
             return
@@ -7345,7 +7391,9 @@ class BrowserCaptchaService:
 
             await self._run_with_timeout(
                 target_browser.send(
-                    cdp.target.dispose_browser_context(browser_context_id)
+                    cdp.target.dispose_browser_context(
+                        self._normalize_browser_context_id(browser_context_id)
+                    )
                 ),
                 timeout_seconds=5.0,
                 label="target.dispose_browser_context",
@@ -7447,7 +7495,9 @@ class BrowserCaptchaService:
         else:
             cookie_command = cdp.storage.set_cookies(
                 cookie_params,
-                browser_context_id=browser_context_id,
+                browser_context_id=self._normalize_browser_context_id(
+                    browser_context_id
+                ),
             )
 
         command_target = tab if browser_context_id is None and tab else self.browser
@@ -7632,6 +7682,8 @@ class BrowserCaptchaService:
             or not self.db
         ):
             return False
+        if resident_info.token_id is not None and resident_info.token_id != int(token_key):
+            return False
 
         browser_context_id = (
             resident_info.browser_context_id
@@ -7645,6 +7697,7 @@ class BrowserCaptchaService:
             current_cookies = await self._get_browser_cookies(
                 label=f"context_cookie_persist_get:{label}",
                 browser_context_id=browser_context_id,
+                fallback_to_global=not self._use_isolated_browser_contexts(),
             )
             serialized_cookies = [
                 normalized_cookie
@@ -7723,7 +7776,8 @@ class BrowserCaptchaService:
             return True
 
         if (
-            os.environ.get("PERSONAL_BROWSER_USER_DATA_DIR", "").strip()
+            not self._use_isolated_browser_contexts()
+            and os.environ.get("PERSONAL_BROWSER_USER_DATA_DIR", "").strip()
             and _env_truthy("PERSONAL_BROWSER_PRESERVE_PROFILE_COOKIES")
         ):
             resident_info.token_id = int(token_key)
@@ -7744,7 +7798,7 @@ class BrowserCaptchaService:
 
         try:
             browser_context_id = resident_info.browser_context_id
-            if self.headless:
+            if self._use_isolated_browser_contexts():
                 browser_context_id = (
                     browser_context_id
                     or self._extract_tab_browser_context_id(resident_info.tab)
@@ -7752,8 +7806,35 @@ class BrowserCaptchaService:
             else:
                 browser_context_id = None
             resident_info.browser_context_id = browser_context_id
+            previous_token_id = resident_info.token_id
+            token_switched = (
+                previous_token_id is not None and previous_token_id != int(token_key)
+            )
 
             async def apply_cookie_update():
+                if token_switched:
+                    from nodriver import cdp
+
+                    if browser_context_id is not None and self.browser:
+                        await self._run_with_timeout(
+                            self.browser.send(
+                                cdp.storage.clear_cookies(
+                                    browser_context_id=self._normalize_browser_context_id(
+                                        browser_context_id
+                                    )
+                                )
+                            ),
+                            timeout_seconds=8.0,
+                            label=f"storage.clear_cookies:switch:{label}:{token_key}",
+                        )
+                    elif browser_context_id is None and resident_info.tab is not None:
+                        await self._run_with_timeout(
+                            resident_info.tab.send(
+                                cdp.network.clear_browser_cookies()
+                            ),
+                            timeout_seconds=8.0,
+                            label=f"network.clear_browser_cookies:switch:{label}:{token_key}",
+                        )
                 return await self._set_browser_cookie_targets(
                     browser_cookies,
                     label=f"storage.set_cookies:{label}:{token_key}",
@@ -8061,9 +8142,10 @@ class BrowserCaptchaService:
                 from nodriver import cdp
 
                 browser_context_id = resident_info.browser_context_id
-                if self.headless and browser_context_id is None:
-                    browser_context_id = self._extract_tab_browser_context_id(
-                        resident_info.tab
+                if self._use_isolated_browser_contexts():
+                    browser_context_id = (
+                        browser_context_id
+                        or self._extract_tab_browser_context_id(resident_info.tab)
                     )
                 else:
                     browser_context_id = None
@@ -8075,7 +8157,9 @@ class BrowserCaptchaService:
                         clear_target = resident_info.tab
                     else:
                         clear_cookie_command = cdp.storage.clear_cookies(
-                            browser_context_id=browser_context_id
+                            browser_context_id=self._normalize_browser_context_id(
+                                browser_context_id
+                            )
                         )
                         clear_target = self.browser
                     await self._run_with_timeout(
@@ -9231,6 +9315,7 @@ class BrowserCaptchaService:
         self._last_fingerprint = None
         self._last_fingerprint_at = 0.0
         clear_cached_session_cookies()
+        self._get_isolated_browser_context_ids().clear()
         self._mark_browser_health(False)
         self._reset_browser_rotation_budget()
         self._reset_local_recaptcha_asset_caches(purge_disk=False)
@@ -12675,7 +12760,7 @@ class BrowserCaptchaService:
         bundled_session_cookies: Optional[Dict[str, str]] = None
         if isinstance(session_cookies, dict) and session_cookies:
             bundled_session_cookies = dict(session_cookies)
-        elif not slot_id:
+        elif not slot_id and token_id is None:
             cached_runtime_cookies = get_cached_session_cookies()
             if isinstance(cached_runtime_cookies, dict) and cached_runtime_cookies:
                 bundled_session_cookies = dict(cached_runtime_cookies)
@@ -12754,26 +12839,54 @@ class BrowserCaptchaService:
             "OTZ",
         }
 
-        bcid = getattr(getattr(tab, "target", None), "browser_context_id", None)
-        for method, kwargs in (
-            (cdp.storage.get_cookies, {}),
-            (cdp.storage.get_cookies, {"browser_context_id": bcid}),
-            (cdp.network.get_all_cookies, {}),
-            (
-                cdp.network.get_cookies,
-                {
-                    "urls": [
-                        "https://www.google.com",
-                        "https://www.recaptcha.net",
-                        "https://accounts.google.com",
-                        "https://flow.google.com",
-                    ]
-                },
-            ),
-        ):
+        bcid = self._normalize_browser_context_id(
+            getattr(resident_info, "browser_context_id", None)
+            or getattr(getattr(tab, "target", None), "browser_context_id", None)
+        )
+        use_isolated = self._use_isolated_browser_contexts()
+        if use_isolated and bcid is not None:
+            cookie_queries = []
+            if self.browser is not None:
+                cookie_queries.append(
+                    (self.browser, cdp.storage.get_cookies, {"browser_context_id": bcid})
+                )
+            cookie_queries.append(
+                (
+                    tab,
+                    cdp.network.get_cookies,
+                    {
+                        "urls": [
+                            "https://www.google.com",
+                            "https://www.recaptcha.net",
+                            "https://accounts.google.com",
+                            "https://flow.google.com",
+                        ]
+                    },
+                )
+            )
+        else:
+            cookie_queries = (
+                (tab, cdp.storage.get_cookies, {}),
+                (tab, cdp.storage.get_cookies, {"browser_context_id": bcid}),
+                (tab, cdp.network.get_all_cookies, {}),
+                (
+                    tab,
+                    cdp.network.get_cookies,
+                    {
+                        "urls": [
+                            "https://www.google.com",
+                            "https://www.recaptcha.net",
+                            "https://accounts.google.com",
+                            "https://flow.google.com",
+                        ]
+                    },
+                ),
+            )
+
+        for sender, method, kwargs in cookie_queries:
             try:
                 effective_kwargs = {k: v for k, v in kwargs.items() if v is not None}
-                raw = await tab.send(method(**effective_kwargs))
+                raw = await sender.send(method(**effective_kwargs))
                 if raw:
                     for cookie in raw:
                         cname = str(getattr(cookie, "name", "") or "").strip()
@@ -12794,7 +12907,8 @@ class BrowserCaptchaService:
                     if collected:
                         resident_info.session_cookies = dict(collected)
                         resident_info.session_cookies_fetched_at = time.time()
-                        set_cached_session_cookies(collected)
+                        if not use_isolated:
+                            set_cached_session_cookies(collected)
                         return dict(collected)
             except Exception:
                 continue
@@ -12871,7 +12985,8 @@ class BrowserCaptchaService:
         if collected:
             resident_info.session_cookies = dict(collected)
             resident_info.session_cookies_fetched_at = time.time()
-            set_cached_session_cookies(collected)
+            if not use_isolated:
+                set_cached_session_cookies(collected)
             return dict(collected)
         return None
 
@@ -13585,7 +13700,7 @@ class BrowserCaptchaService:
                 label=f"resident_browser_create_context:{slot_id}",
                 create_timeout_seconds=self._navigation_timeout_seconds,
             )
-            if browser_context_id is None and self.headless:
+            if browser_context_id is None and self._use_isolated_browser_contexts():
                 browser_context_id = self._extract_tab_browser_context_id(tab)
 
             # 等待页面加载完成（减少等待时间）
@@ -13786,7 +13901,7 @@ class BrowserCaptchaService:
                         label=f"legacy_browser_create_context:{project_id}",
                         create_timeout_seconds=self._navigation_timeout_seconds,
                     )
-                    if browser_context_id is None and self.headless:
+                    if browser_context_id is None and self._use_isolated_browser_contexts():
                         browser_context_id = (
                             self._extract_tab_browser_context_id(tab)
                         )
