@@ -371,7 +371,7 @@ class FlowFrontendMixin:
                     or type(source_end_frame) is not int
                     or not 0 <= source_start_frame < source_end_frame):
                 raise ValueError("Video edit requires a source media ID and frame range")
-            if model_key != "macaron_cookie_edit_360p":
+            if model_key not in ("macaron_cookie_edit_360p", "macaron_cookie_edit"):
                 raise ValueError("Unverified video edit model key")
             references = [
                 self._frontend_media_reference(media_id)
@@ -380,9 +380,9 @@ class FlowFrontendMixin:
             ] or None
             if references and len(references) > 3:
                 raise ValueError("Video edit supports at most 3 reference images")
-            # HAR entries 66/81/103 & omini-sucai HARs: source range (7 elements including duration),
-            # prompt, key, ratio, metadata, three nulls, optional reference images at slot [0][8],
-            # three nulls, then the recorded edit-mode enum [4].
+            # HAR entries 66/81/103 (360p) & 720p.har entries 59/112/179 (720p):
+            # 360p uses macaron_cookie_edit_360p with trailing [None, None, None, [4]];
+            # 720p uses macaron_cookie_edit and terminates at slot [8] (references).
             rpc_id = "jIps6"
             total_frames = max(1, source_end_frame - source_start_frame)
             duration_seconds = total_frames / 24.0
@@ -406,11 +406,9 @@ class FlowFrontendMixin:
                 None,
                 None,
                 references,
-                None,
-                None,
-                None,
-                [4],
             ]
+            if model_key == "macaron_cookie_edit_360p":
+                request.extend([None, None, None, [4]])
         elif normalized_mode == "references":
             references = [
                 self._frontend_media_reference(media_id)

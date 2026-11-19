@@ -1758,8 +1758,8 @@ async def create_video_generation_task(
             raise HTTPException(400, "Video editing cannot be mixed with frame generation")
         if declared_image_count > 3:
             raise HTTPException(400, "Video editing supports at most 3 reference images")
-        if (resolution or "").lower() != "360p":
-            raise HTTPException(400, "Captured video-edit mapping requires resolution=360p")
+        if (resolution or "360p").strip().lower() not in ("360p", "720p"):
+            raise HTTPException(400, "Captured video-edit mapping requires resolution=360p or resolution=720p")
         if req.source_end_frame is None or not 0 <= (req.source_start_frame or 0) < req.source_end_frame:
             raise HTTPException(400, "An explicit increasing source frame range is required")
     elif resolution and resolution.lower() != "720p":
