@@ -3447,6 +3447,7 @@ class GenerationHandler:
         consecutive_poll_errors = 0
         last_poll_error: Optional[Exception] = None
         max_consecutive_poll_errors = 3
+        poll_auth_refreshed = False
 
         for attempt in range(max_attempts):
             remaining = poll_deadline - time.monotonic()
@@ -3767,6 +3768,37 @@ class GenerationHandler:
                     return
                     
             except Exception as e:
+                if (
+                    token
+                    and self._is_flow_auth_401_error(e)
+                    and not poll_auth_refreshed
+                ):
+                    poll_auth_refreshed = True
+                    if await self._try_refresh_cookies_after_401(token.id):
+                        get_fn = getattr(self.token_manager, "get_token", None)
+                        if callable(get_fn):
+                            try:
+                                fetched = get_fn(token.id)
+                                latest_token = (
+                                    await fetched
+                                    if inspect.isawaitable(fetched)
+                                    else fetched
+                                )
+                                if latest_token and getattr(
+                                    latest_token, "google_cookies", None
+                                ):
+                                    token.google_cookies = latest_token.google_cookies
+                            except Exception as fetch_err:
+                                debug_logger.log_warning(
+                                    f"[VIDEO POLL] Token {token.id} 重读刷新后 Cookie 失败: "
+                                    f"{str(fetch_err)[:200]}"
+                                )
+                        consecutive_poll_errors = 0
+                        last_poll_error = None
+                        debug_logger.log_warning(
+                            f"[VIDEO POLL] Token {token.id} 状态查询遇到 Flow 401，已刷新 Cookie 并继续轮询"
+                        )
+                        continue
                 last_poll_error = e
                 consecutive_poll_errors += 1
                 debug_logger.log_error(f"Poll error: {str(e)}")

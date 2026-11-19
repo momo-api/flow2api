@@ -273,10 +273,13 @@ class CurrentFlowClientMixin:
     ) -> dict:
         normalized_name = self._normalize_media_name(media_name)
         normalized_operation = self._normalize_media_name(operation_id or "")
+        active_google_cookies = await self._reload_latest_google_cookies(
+            google_cookies, token_id
+        )
         payload = await self._current_rpc(
             rpc_id="as29s",
             argument=[normalized_operation or normalized_name],
-            google_cookies=google_cookies,
+            google_cookies=active_google_cookies,
             token_id=token_id,
             project_id=project_id,
             source_path=(
@@ -329,10 +332,13 @@ class CurrentFlowClientMixin:
         names = [self._normalize_media_name(name) for name in media_names if name]
         if not names:
             return
+        active_google_cookies = await self._reload_latest_google_cookies(
+            google_cookies, token_id
+        )
         await self._current_rpc(
             rpc_id="cz8Z4b",
             argument=[names, None, project_id],
-            google_cookies=google_cookies,
+            google_cookies=active_google_cookies,
             token_id=token_id,
             project_id=project_id,
         )
@@ -367,6 +373,9 @@ class CurrentFlowClientMixin:
             if not recaptcha_token:
                 raise RuntimeError("Failed to obtain reCAPTCHA token for image upload")
             try:
+                active_google_cookies = await self._reload_latest_google_cookies(
+                    google_cookies, token_id
+                )
                 context = self._frontend_project_context(
                     normalized_project_id,
                     recaptcha_token,
@@ -387,7 +396,7 @@ class CurrentFlowClientMixin:
                         str(uuid.uuid4()).upper(),
                         str(uuid.uuid4()).upper(),
                     ],
-                    google_cookies=google_cookies,
+                    google_cookies=active_google_cookies,
                     token_id=token_id,
                     project_id=normalized_project_id,
                     timeout=max(self._get_control_plane_timeout(), 90),
@@ -446,8 +455,11 @@ class CurrentFlowClientMixin:
             ext = "webm" if mime_type == "video/webm" else "mov"
             filename = f"flow2api_video.{ext}"
 
+        active_google_cookies = await self._reload_latest_google_cookies(
+            google_cookies, token_id
+        )
         storage = await self._resolve_flow_frontend_cookie_storage(
-            google_cookies=google_cookies, token_id=token_id
+            google_cookies=active_google_cookies, token_id=token_id
         )
         if not storage:
             raise RuntimeError("Flow video upload requires Google session cookies")
@@ -577,11 +589,14 @@ class CurrentFlowClientMixin:
             if remaining <= 0:
                 raise TimeoutError("Flow uploaded video processing timed out")
             try:
+                active_google_cookies = await self._reload_latest_google_cookies(
+                    google_cookies, token_id
+                )
                 payload = await asyncio.wait_for(
                     self._current_rpc(
                         rpc_id="as29s",
                         argument=[media_id],
-                        google_cookies=google_cookies,
+                        google_cookies=active_google_cookies,
                         token_id=token_id,
                         project_id=project_id,
                     ),
@@ -1159,10 +1174,13 @@ class CurrentFlowClientMixin:
             raise ValueError("视频状态查询缺少 Flow frontend operation ID")
         first_operation = operations[0] if operations else {}
         project_id = str((first_operation or {}).get("projectId") or "").strip()
+        active_google_cookies = await self._reload_latest_google_cookies(
+            google_cookies, token_id
+        )
         payload = await self._current_rpc(
             rpc_id="jwpduf",
             argument=[None, None, [[operation_id] for operation_id in operation_ids]],
-            google_cookies=google_cookies,
+            google_cookies=active_google_cookies,
             token_id=token_id,
             project_id=project_id or None,
             timeout=max(self._get_video_poll_timeout(), 30),
@@ -1198,7 +1216,7 @@ class CurrentFlowClientMixin:
                 media = await self.get_media(
                     at,
                     media_name,
-                    google_cookies=google_cookies,
+                    google_cookies=active_google_cookies,
                     token_id=token_id,
                     project_id=project_id or None,
                     operation_id=operation_id or None,
