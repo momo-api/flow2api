@@ -160,6 +160,95 @@ class FlowCookieReloadAfterRecaptchaTests(unittest.IsolatedAsyncioTestCase):
             "old-cookies",
         )
 
+    async def test_check_video_status_reloads_fresh_cookies_and_media_fallback(self):
+        client, db, state = self._make_client_with_rotating_db()
+        state["cookies"] = "fresh-poll-cookies"
+        rpc_calls = []
+
+        async def fake_current_rpc(*, rpc_id, google_cookies=None, **kwargs):
+            rpc_calls.append((rpc_id, google_cookies))
+            if rpc_id == "jwpduf":
+                return [[OP_ID, PROJECT_ID, MEDIA_ID, "active"]]
+            return [None, PROJECT_ID]
+
+        client._current_rpc = AsyncMock(side_effect=fake_current_rpc)
+        client._normalize_frontend_video_status = MagicMock(
+            return_value={
+                "operations": [
+                    {
+                        "name": OP_ID,
+                        "mediaName": MEDIA_ID,
+                        "status": "MEDIA_GENERATION_STATUS_ACTIVE",
+                        "operation": {"name": OP_ID, "metadata": {"video": {}}},
+                    }
+                ]
+            }
+        )
+        client._find_media_url = MagicMock(return_value="https://example.com/video/1.mp4")
+
+        result = await client.check_video_status(
+            "flow-frontend-cookie",
+            [{"name": OP_ID, "projectId": PROJECT_ID}],
+            token_id=1,
+            google_cookies="stale-pre-captcha-cookies",
+        )
+
+        self.assertEqual(rpc_calls[0], ("jwpduf", "fresh-poll-cookies"))
+        self.assertEqual(rpc_calls[1], ("as29s", "fresh-poll-cookies"))
+        self.assertEqual(
+            result["operations"][0]["operation"]["metadata"]["video"]["fifeUrl"],
+            "https://example.com/video/1.mp4",
+        )
+        self.assertGreaterEqual(db.get_token.await_count, 2)
+
+    async def test_upload_image_reloads_fresh_cookies_after_recaptcha(self):
+        client, db, _ = self._make_client_with_rotating_db()
+        captured = {}
+
+        async def fake_current_rpc(*, rpc_id, google_cookies=None, **kwargs):
+            captured["rpc_id"] = rpc_id
+            captured["google_cookies"] = google_cookies
+            return [[f"https://example.com/image/{MEDIA_ID}"]]
+
+        client._current_rpc = AsyncMock(side_effect=fake_current_rpc)
+        media_id = await client.upload_image(
+            "flow-frontend-cookie",
+            b"\x89PNG\r\n\x1a\nfake",
+            project_id=PROJECT_ID,
+            token_id=1,
+            google_cookies="old-cookies",
+        )
+
+        self.assertEqual(captured["rpc_id"], "maseQ")
+        self.assertEqual(captured["google_cookies"], "fresh-cookies-after-warmup")
+        self.assertEqual(media_id, MEDIA_ID)
+        db.get_token.assert_awaited_once_with(1)
+
+    async def test_wait_for_video_media_ready_reloads_fresh_cookies(self):
+        client, db, state = self._make_client_with_rotating_db()
+        state["cookies"] = "fresh-ready-cookies"
+        captured = {}
+
+        async def fake_current_rpc(*, rpc_id, google_cookies=None, **kwargs):
+            captured["rpc_id"] = rpc_id
+            captured["google_cookies"] = google_cookies
+            return [MEDIA_ID, PROJECT_ID, "https://example.com/video/ready.mp4"]
+
+        client._current_rpc = AsyncMock(side_effect=fake_current_rpc)
+        client._find_flow_content_url = MagicMock(return_value="https://example.com/video/ready.mp4")
+        await client.wait_for_video_media_ready(
+            MEDIA_ID,
+            PROJECT_ID,
+            google_cookies="stale-cookies",
+            token_id=1,
+            timeout=5,
+            poll_interval=0.1,
+        )
+
+        self.assertEqual(captured["rpc_id"], "as29s")
+        self.assertEqual(captured["google_cookies"], "fresh-ready-cookies")
+        db.get_token.assert_awaited_once_with(1)
+
 
 class GenerationHandlerAuth401RetryTests(unittest.IsolatedAsyncioTestCase):
     def _build_handler(self, *, fail_count: int, refresh_ok: bool = True):
@@ -249,6 +338,139 @@ class GenerationHandlerAuth401RetryTests(unittest.IsolatedAsyncioTestCase):
         token_manager.record_error.assert_awaited_once_with(1)
         err = json.loads(chunks[-1])["error"]
         self.assertIn("code=401", err["message"])
+
+    async def test_poll_video_result_refreshes_cookies_once_on_401_then_succeeds(self):
+        token = _token(1, "stale-poll-cookies")
+        token.at = "flow-frontend-cookie"
+        token.video_concurrency = -1
+        token_manager = MagicMock()
+        refreshed_tok = _token(1, "fresh-poll-cookies")
+
+        async def fake_refresh_cookies(tid):
+            token.google_cookies = "fresh-poll-cookies"
+            return True
+
+        token_manager.refresh_cookies = AsyncMock(side_effect=fake_refresh_cookies)
+        token_manager.get_token = AsyncMock(return_value=refreshed_tok)
+
+        handler = GenerationHandler.__new__(GenerationHandler)
+        handler.token_manager = token_manager
+        handler.load_balancer = MagicMock()
+        handler.db = MagicMock()
+        handler.db.update_task = AsyncMock()
+        handler.flow_client = MagicMock()
+        handler.flow_client.download_video_bytes = AsyncMock()
+
+        poll_401 = (
+            "Flow 登录认证失败：Google Cookie 已失效、不完整，或来自不同账号 (rpc=jwpduf, code=401)"
+        )
+        seen_poll_cookies = []
+        poll_count = {"n": 0}
+
+        async def fake_check_video_status(at, operations, token_id=None, google_cookies=None):
+            poll_count["n"] += 1
+            seen_poll_cookies.append(google_cookies)
+            if poll_count["n"] == 1:
+                raise RuntimeError(poll_401)
+            return {
+                "operations": [
+                    {
+                        "name": OP_ID,
+                        "mediaName": MEDIA_ID,
+                        "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+                        "operation": {
+                            "name": OP_ID,
+                            "metadata": {
+                                "video": {
+                                    "aspectRatio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+                                    "mediaName": MEDIA_ID,
+                                }
+                            },
+                        },
+                    }
+                ]
+            }
+
+        handler.flow_client.check_video_status = AsyncMock(side_effect=fake_check_video_status)
+        handler._resolve_video_asset = AsyncMock(
+            return_value={
+                "video_url": "https://example.com/upstream/video.mp4",
+                "video_media_id": MEDIA_ID,
+                "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+                "media_name": MEDIA_ID,
+                "metadata": {},
+                "video_info": {},
+            }
+        )
+        handler._fail_video_task = AsyncMock()
+        generation_result = handler._create_generation_result()
+        operations = [{"name": OP_ID, "projectId": PROJECT_ID, "operation": {"name": OP_ID}}]
+
+        with (
+            patch("src.services.generation_handler.r2_storage.is_r2_video_storage_configured", return_value=False),
+            patch(
+                "src.services.generation_handler.config",
+                SimpleNamespace(poll_interval=0.01, video_timeout=5, cache_enabled=False),
+            ),
+        ):
+            chunks = [
+                chunk
+                async for chunk in handler._poll_video_result(
+                    token,
+                    PROJECT_ID,
+                    operations,
+                    stream=False,
+                    generation_result=generation_result,
+                )
+            ]
+
+        self.assertEqual(poll_count["n"], 2)
+        self.assertEqual(seen_poll_cookies, ["stale-poll-cookies", "fresh-poll-cookies"])
+        token_manager.refresh_cookies.assert_awaited_once_with(1)
+        handler._fail_video_task.assert_not_awaited()
+        self.assertTrue(generation_result["success"])
+        self.assertIn("https://example.com/upstream/video.mp4", chunks[-1])
+
+    async def test_poll_video_result_stops_after_max_errors_if_401_persists(self):
+        token = _token(1, "stale-poll-cookies")
+        token.at = "flow-frontend-cookie"
+        token_manager = MagicMock()
+        token_manager.refresh_cookies = AsyncMock(return_value=True)
+        token_manager.get_token = AsyncMock(return_value=_token(1, "fresh-poll-cookies"))
+
+        handler = GenerationHandler.__new__(GenerationHandler)
+        handler.token_manager = token_manager
+        handler.flow_client = MagicMock()
+        poll_401 = (
+            "Flow 登录认证失败：Google Cookie 已失效、不完整，或来自不同账号 (rpc=jwpduf, code=401)"
+        )
+        handler.flow_client.check_video_status = AsyncMock(side_effect=RuntimeError(poll_401))
+        handler._fail_video_task = AsyncMock()
+        generation_result = handler._create_generation_result()
+        operations = [{"name": OP_ID, "projectId": PROJECT_ID, "operation": {"name": OP_ID}}]
+
+        with patch(
+            "src.services.generation_handler.config",
+            SimpleNamespace(poll_interval=0.01, video_timeout=5, cache_enabled=False),
+        ):
+            chunks = [
+                chunk
+                async for chunk in handler._poll_video_result(
+                    token,
+                    PROJECT_ID,
+                    operations,
+                    stream=False,
+                    generation_result=generation_result,
+                )
+            ]
+
+        # Attempt 1 triggers single refresh_cookies (without incrementing poll error),
+        # then 3 consecutive poll failures terminate cleanly.
+        self.assertEqual(handler.flow_client.check_video_status.await_count, 4)
+        token_manager.refresh_cookies.assert_awaited_once_with(1)
+        handler._fail_video_task.assert_awaited_once()
+        self.assertFalse(generation_result["success"])
+        self.assertIn("视频状态查询失败", chunks[-1])
 
 
 if __name__ == "__main__":
