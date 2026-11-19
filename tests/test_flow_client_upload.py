@@ -175,6 +175,42 @@ class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["source_start_frame"], 0)
         self.assertEqual(kwargs["source_end_frame"], 184)
 
+    async def test_video_edit_720p_uses_macaron_cookie_edit_payload(self):
+        client = FlowClient(proxy_manager=None)
+        client._current_generate_video = AsyncMock(return_value={"ok": True})
+        await client.generate_video_edit(
+            at="frontend-cookie",
+            project_id=PROJECT_ID,
+            prompt="make it dance",
+            source_media_id=MEDIA_ID,
+            aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
+            source_start_frame=0,
+            source_end_frame=184,
+            resolution="720p",
+            google_cookies="SID=session-cookie",
+        )
+        kwargs = client._current_generate_video.await_args.kwargs
+        self.assertEqual(kwargs["model_key"], "macaron_cookie_edit")
+        self.assertEqual(kwargs["resolution"], "720p")
+
+        rpc_id, argument = client._build_frontend_video_generation_argument(
+            project_id=PROJECT_ID,
+            prompt="make it dance",
+            model_key="macaron_cookie_edit",
+            aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
+            recaptcha_token="captcha-token",
+            session_id="01234567-89ab-cdef-0123-456789abcdef",
+            mode="edit",
+            start_media_id=MEDIA_ID,
+            source_start_frame=0,
+            source_end_frame=184,
+            resolution="720p",
+        )
+        self.assertEqual(rpc_id, "jIps6")
+        request = argument[0][0]
+        self.assertEqual(len(request), 9)
+        self.assertEqual(request[2], "macaron_cookie_edit")
+
 
 if __name__ == "__main__":
     unittest.main()

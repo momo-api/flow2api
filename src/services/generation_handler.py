@@ -2899,7 +2899,8 @@ class GenerationHandler:
             model_config["model_key"] = model_key
 
             if source_video is not None:
-                if (video_type != "omni" or resolution != "360p"
+                if (video_type != "omni"
+                        or str(resolution or "360p").strip().lower() not in ("360p", "720p")
                         or first_frame is not None or last_frame is not None):
                     raise ValueError("Video editing cannot be mixed with frame generation")
                 if images and len(images) > 3:
@@ -3085,6 +3086,7 @@ class GenerationHandler:
                         source_start_frame=source_start_frame,
                         source_end_frame=source_end_frame,
                         reference_media_ids=ref_media_ids,
+                        resolution=resolution or "360p",
                         aspect_ratio=model_config["aspect_ratio"],
                         user_paygate_tier=normalized_tier,
                         token_id=token.id,
@@ -3117,6 +3119,7 @@ class GenerationHandler:
                             source_start_frame=source_start_frame,
                             source_end_frame=source_end_frame,
                             reference_media_ids=ref_media_ids,
+                            resolution=resolution or "360p",
                             aspect_ratio=model_config["aspect_ratio"],
                             user_paygate_tier=normalized_tier,
                             token_id=token.id,

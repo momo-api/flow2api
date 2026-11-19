@@ -1004,15 +1004,20 @@ class CurrentFlowClientMixin:
         source_end_frame: int,
         source_start_frame: int = 0,
         reference_media_ids: Optional[List[str]] = None,
+        resolution: str = "360p",
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
         google_cookies: Optional[str] = None,
     ) -> dict:
+        norm_res = str(resolution or "360p").strip().lower()
+        if norm_res not in ("360p", "720p"):
+            raise ValueError("Video edit supports resolution=360p or resolution=720p")
+        edit_model_key = "macaron_cookie_edit" if norm_res == "720p" else "macaron_cookie_edit_360p"
         return await self._current_generate_video(
             project_id=project_id,
             prompt=prompt,
-            model_key="macaron_cookie_edit_360p",
+            model_key=edit_model_key,
             aspect_ratio=aspect_ratio,
             mode="edit",
             reference_media_ids=reference_media_ids,
@@ -1020,7 +1025,7 @@ class CurrentFlowClientMixin:
             token_id=token_id,
             token_video_concurrency=token_video_concurrency,
             google_cookies=google_cookies,
-            resolution="360p",
+            resolution=norm_res,
             source_start_frame=source_start_frame,
             source_end_frame=source_end_frame,
         )
